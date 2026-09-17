@@ -38,9 +38,18 @@ Use this checklist on a real macOS machine after installing from the generated D
    - Integrations
    - Dictionary
    - Snippets
-   - Tone
+   - Style
 2. Confirm notes page is not present in sidebar navigation.
 3. Open `Settings -> System` and verify the local transcription model can be selected, downloaded, and reports `Ready` after installation.
+4. From `Settings -> General`, run **Check for updates** and verify the current-version or update state is reported without blocking the UI.
+
+## Native shell lifecycle
+
+1. Close the dashboard and verify ListenOS remains available from the menu bar when the tray/menu-bar setting is enabled.
+2. Use **Open Dashboard** from the menu-bar item and verify the existing dashboard is shown and focused.
+3. Launch ListenOS a second time and verify the existing application is activated rather than creating a second independent instance.
+4. Open a `listenos://` URL and verify the existing dashboard is brought forward.
+5. Enable **Start on login**, confirm macOS reports the expected approval state if needed, then disable it again.
 
 ## Files and System Actions
 
@@ -53,7 +62,9 @@ Use this checklist on a real macOS machine after installing from the generated D
 
 1. Confirm overlay remains centered and visible.
 2. Confirm listening/processing states are visible in the chip.
-3. Confirm voice waveform reacts while speaking.
+3. Confirm the compact listening indicator reacts while speaking without drawing any decorative desktop-border effect.
+4. Trigger an action that requires confirmation and verify the compact overlay control surface offers **Confirm** and **Cancel** without activating the dashboard.
+5. Enter hands-free listening and verify **Cancel** and **Stop** are usable from the compact overlay control surface without activating the dashboard.
 
 ## Theme and Visibility
 

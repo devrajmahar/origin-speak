@@ -6,12 +6,20 @@ authors = ["ListenOS"]
 license = "PROPRIETARY"
 edition = "2021"
 
+[features]
+default = []
+# VoxType's deployable Whisper strategy uses Vulkan as the cross-vendor
+# Windows GPU backend and Metal on macOS. These SDKs are build-time inputs;
+# shipped users only need a working graphics driver/runtime.
+gpu-vulkan = ["whisper-rs/vulkan"]
+gpu-metal = ["whisper-rs/metal"]
+
 [lib]
 name = "voice_os_lib"
 crate-type = ["rlib"]
 
 [dependencies]
-# Desktop IPC and global shortcuts
+# Global shortcuts
 global-hotkey = "0.7"
 
 # Serialization
@@ -38,7 +46,6 @@ enigo = "0.2"
 
 # Logging
 log = "0.4"
-env_logger = "0.10"
 
 # Date/Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -48,8 +55,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # URL handling
 url = "2"
-
-dotenvy = "0.15.7"
 
 # SQLite for persistent storage
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -76,6 +81,9 @@ windows = { version = "0.56", features = [
 [profile.release]
 strip = true
 lto = true
-opt-level = "z"
+# Whisper inference is compute-bound: `opt-level = "z"` (size) costs
+# 20-40% CPU throughput versus speed optimization. Keep LTO + single
+# codegen unit for speed; binary size growth is negligible next to models.
+opt-level = 3
 codegen-units = 1
 panic = "abort"

@@ -5,85 +5,360 @@ on:
     tags:
       - "v*"
 
-jobs:
-  build-electron:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: windows
-            platform: windows-latest
-            buildScript: desktop:build:windows
-          - id: macos
-            platform: macos-latest
-            buildScript: desktop:build:mac
-          - id: linux
-            platform: ubuntu-22.04
-            buildScript: desktop:build:linux
+permissions:
+  contents: read
 
-    runs-on: ${{ matrix.platform }}
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfuse2 libxdo-dev
+      - name: Verify tag matches native version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo metadata --manifest-path native/Cargo.toml --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "Tag version $VERSION does not match native/Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: npm install --no-package-lock
+  windows:
+    runs-on: windows-latest
+    needs: metadata
+    env:
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
+      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+      VULKAN_SDK_VERSION: "1.4.357.0"
+      VULKAN_SDK_SHA256: "81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d"
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Configure updater URL
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --yes --no-progress
+
+      - name: Install pinned Vulkan SDK build tools
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "VulkanSDK-$env:VULKAN_SDK_VERSION"
+          $installerPath = Join-Path $env:RUNNER_TEMP "vulkan-sdk.exe"
+          $installerUrl = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkan_sdk.exe"
+
+          Invoke-WebRequest -UseBasicParsing -Uri $installerUrl -OutFile $installerPath
+          $actualHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:VULKAN_SDK_SHA256) {
+            throw "Vulkan SDK installer SHA-256 mismatch: expected $env:VULKAN_SDK_SHA256, got $actualHash"
+          }
+
+          & $installerPath `
+            --root $sdkRoot `
+            --accept-licenses `
+            --default-answer `
+            --confirm-command install `
+            copy_only=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vulkan SDK installer failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $sdkRoot "Bin\glslc.exe") -PathType Leaf)) {
+            throw "Pinned Vulkan SDK did not provide Bin\glslc.exe"
+          }
+
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VK_SDK_PATH=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $sdkRoot "Bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Require Windows release signing credentials
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX_BASE64)) {
+            throw "Tagged native releases require secret WINDOWS_CERTIFICATE_PFX_BASE64."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "Tagged native releases require secret WINDOWS_CERTIFICATE_PASSWORD."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_TIMESTAMP_URL)) {
+            throw "Tagged native releases require repository variable WINDOWS_SIGN_TIMESTAMP_URL."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:R2_PUBLIC_BASE_URL)) {
+            throw "Tagged native releases require secret CLOUDFLARE_R2_PUBLIC_BASE_URL."
+          }
+
+      - name: Configure native updater endpoint
+        shell: pwsh
+        run: |
+          $baseUrl = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
+          $uri = $null
+          if (-not [Uri]::TryCreate($baseUrl, [UriKind]::Absolute, [ref]$uri) -or
+              $uri.Scheme -ne 'https' -or
+              [string]::IsNullOrWhiteSpace($uri.Host) -or
+              -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+              -not [string]::IsNullOrEmpty($uri.Query) -or
+              -not [string]::IsNullOrEmpty($uri.Fragment)) {
+            throw "CLOUDFLARE_R2_PUBLIC_BASE_URL must be a credential-free HTTPS origin/path without query or fragment."
+          }
+          "LISTENOS_UPDATE_MANIFEST_URL=$baseUrl/native-update.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Prepare Windows signing certificate
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "listenos-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64)
+          )
+          "WINDOWS_SIGNING_CERTIFICATE_PATH=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build native release binary
+        run: cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-vulkan
+
+      - name: Package and sign Windows installer
         shell: pwsh
         env:
-          R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File native/packaging/windows/package.ps1
+          -Version "${{ needs.metadata.outputs.version }}"
+          -OutputDir "dist/native/windows"
+
+      - name: Remove Windows signing certificate
+        if: always()
+        shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:R2_PUBLIC_BASE_URL)) {
-            throw "Missing secret CLOUDFLARE_R2_PUBLIC_BASE_URL"
+          if ($env:WINDOWS_SIGNING_CERTIFICATE_PATH -and (Test-Path -LiteralPath $env:WINDOWS_SIGNING_CERTIFICATE_PATH)) {
+            Remove-Item -LiteralPath $env:WINDOWS_SIGNING_CERTIFICATE_PATH -Force
           }
-          node scripts/set-updater-endpoint.mjs $env:R2_PUBLIC_BASE_URL
 
-      - name: Build Electron app
-        run: npm run ${{ matrix.buildScript }}
-
-      - name: Upload packaged artifacts
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: electron-${{ matrix.id }}
+          name: native-windows-${{ needs.metadata.outputs.version }}
           path: |
-            dist/electron/*.exe
-            dist/electron/*.blockmap
-            dist/electron/*.dmg
-            dist/electron/*.zip
-            dist/electron/*.AppImage
-            dist/electron/latest*.yml
+            dist/native/windows/*.exe
+            dist/native/windows/*.sha256
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    needs: metadata
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      MACOS_NOTARIZE: "1"
+      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Require macOS release trust credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in \
+            MACOS_CERTIFICATE_P12_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD \
+            MACOS_CODESIGN_IDENTITY \
+            APPLE_ID \
+            APPLE_TEAM_ID \
+            APPLE_APP_SPECIFIC_PASSWORD \
+            R2_PUBLIC_BASE_URL; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "Tagged native releases require $variable." >&2
+              exit 1
+            fi
+          done
+
+      - name: Configure native updater endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import os
+          from urllib.parse import urlsplit
+
+          base_url = os.environ["R2_PUBLIC_BASE_URL"].rstrip("/")
+          parsed = urlsplit(base_url)
+          if (
+              parsed.scheme != "https"
+              or not parsed.netloc
+              or parsed.username is not None
+              or parsed.password is not None
+              or parsed.query
+              or parsed.fragment
+          ):
+              raise SystemExit(
+                  "CLOUDFLARE_R2_PUBLIC_BASE_URL must be a credential-free HTTPS origin/path without query or fragment."
+              )
+          print(f"LISTENOS_UPDATE_MANIFEST_URL={base_url}/native-update.json")
+          PY
+
+      - name: Import Developer ID certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/listenos-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/listenos-signing.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["RUNNER_TEMP"], "listenos-signing.p12").write_bytes(
+              base64.b64decode(os.environ["MACOS_CERTIFICATE_P12_BASE64"], validate=True)
+          )
+          PY
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$MACOS_CODESIGN_IDENTITY"
+          echo "MACOS_RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Build native release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target aarch64-apple-darwin
+          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target x86_64-apple-darwin
+          mkdir -p native/target/release
+          lipo -create \
+            native/target/aarch64-apple-darwin/release/listenos-native \
+            native/target/x86_64-apple-darwin/release/listenos-native \
+            -output native/target/release/listenos-native
+          ARCHS="$(lipo -archs native/target/release/listenos-native)"
+          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
+
+      - name: Package, sign, and notarize macOS release
+        shell: bash
+        run: |
+          bash native/packaging/macos/package.sh "${{ needs.metadata.outputs.version }}" "dist/native/macos"
+
+      - name: Inspect packaged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHS="$(lipo -archs dist/native/macos/ListenOS.app/Contents/MacOS/ListenOS)"
+          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
+          plutil -lint dist/native/macos/ListenOS.app/Contents/Info.plist
+          codesign --verify --deep --strict --verbose=2 dist/native/macos/ListenOS.app
+          xcrun stapler validate dist/native/macos/ListenOS.app
+          hdiutil verify dist/native/macos/*.dmg
+          xcrun stapler validate dist/native/macos/*.dmg
+
+      - name: Remove macOS signing keychain
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${MACOS_RELEASE_KEYCHAIN:-}" && -f "$MACOS_RELEASE_KEYCHAIN" ]]; then
+            security delete-keychain "$MACOS_RELEASE_KEYCHAIN" || true
+          fi
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-${{ needs.metadata.outputs.version }}
+          path: |
+            dist/native/macos/*.dmg
+            dist/native/macos/*.zip
+            dist/native/macos/SHA256SUMS.txt
           if-no-files-found: error
 
   publish-r2:
     runs-on: ubuntu-latest
-    needs: build-electron
+    needs: [metadata, windows, macos]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: auto
       R2_ENDPOINT: ${{ secrets.CLOUDFLARE_R2_ENDPOINT }}
       R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: electron-*
+          pattern: native-*
           path: dist/publish
           merge-multiple: true
 
-      - name: Upload release files to Cloudflare R2
+      - uses: actions/checkout@v4
+
+      - name: Require R2 publication configuration
+        shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/releases/v${VERSION}/" --recursive --endpoint-url "${R2_ENDPOINT}" --no-progress
-          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/" --recursive --endpoint-url "${R2_ENDPOINT}" --no-progress
+          set -euo pipefail
+          for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_BASE_URL; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "Tagged native releases require $variable publication configuration." >&2
+              exit 1
+            fi
+          done
+
+      - name: Generate native updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.metadata.outputs.version }}"
+          python3 native/packaging/generate_update_manifest.py \
+            --version "$VERSION" \
+            --public-base-url "$R2_PUBLIC_BASE_URL" \
+            --release-prefix "releases/v$VERSION" \
+            --artifact-root dist/publish \
+            --output dist/publish/native-update.json
+
+      - name: Validate native updater contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.metadata.outputs.version }}"
+          python3 native/packaging/validate_update_manifest.py \
+            --manifest dist/publish/native-update.json \
+            --version "$VERSION" \
+            --public-base-url "$R2_PUBLIC_BASE_URL" \
+            --release-prefix "releases/v$VERSION" \
+            --artifact-root dist/publish
+
+      - name: Upload native release files to Cloudflare R2
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.metadata.outputs.version }}"
+          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/releases/v${VERSION}/" \
+            --recursive \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-progress
+          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/" \
+            --recursive \
+            --endpoint-url "$R2_ENDPOINT" \
+            --no-progress

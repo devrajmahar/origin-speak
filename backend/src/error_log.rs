@@ -65,8 +65,8 @@ impl ErrorLog {
     /// Log a new error
     pub fn log(&mut self, entry: ErrorEntry) {
         log::error!(
-            "[{}] {}: {}",
-            format!("{:?}", entry.error_type),
+            "[{:?}] {}: {}",
+            entry.error_type,
             entry.message,
             entry.details.as_deref().unwrap_or("")
         );

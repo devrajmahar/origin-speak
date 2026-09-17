@@ -465,7 +465,7 @@ impl SystemControlsIntegration {
                 }
             };
             let output = Self::run_powershell(script)?;
-            return Ok(output.trim().to_string());
+            Ok(output.trim().to_string())
         }
 
         #[cfg(target_os = "macos")]
@@ -589,7 +589,7 @@ impl SystemControlsIntegration {
                 }
             };
             let output = Self::run_powershell(script)?;
-            return Ok(output.trim().to_string());
+            Ok(output.trim().to_string())
         }
 
         #[cfg(target_os = "macos")]
@@ -677,7 +677,7 @@ impl SystemControlsIntegration {
             let dir = base.join("Pictures").join("Screenshots");
             fs::create_dir_all(&dir)
                 .map_err(|e| format!("Failed to create screenshots directory: {}", e))?;
-            return Ok(dir);
+            Ok(dir)
         }
 
         #[cfg(not(windows))]
@@ -724,7 +724,7 @@ impl SystemControlsIntegration {
                 .arg(folder)
                 .spawn()
                 .map_err(|e| format!("Failed to open folder in Explorer: {}", e))?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(target_os = "macos")]

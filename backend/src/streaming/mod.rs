@@ -6,9 +6,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    mpsc, Arc, Mutex,
 };
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,19 +67,39 @@ pub struct AudioStreamer {
     is_recording: Arc<AtomicBool>,
     accumulated_samples: Arc<Mutex<Vec<f32>>>,
     live_level_bits: Arc<AtomicU32>,
-    // Store stream handle to keep it alive
-    stream_handle: Arc<Mutex<Option<StreamHandle>>>,
+    last_stream_release_ms: Arc<AtomicU64>,
+    lifecycle: Mutex<()>,
+    capture_owner: Mutex<Option<CaptureOwner>>,
     runtime: Arc<Mutex<RuntimeMetrics>>,
 }
 
-/// Wrapper to hold the stream (cpal::Stream is not Send on some platforms)
-struct StreamHandle {
-    _stream: cpal::Stream,
+/// Control plane for the thread that owns the non-Send CPAL stream.
+///
+/// The stream itself never leaves that thread; only this channel and join
+/// handle are shared with `AudioStreamer`.
+struct CaptureOwner {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
 }
 
-// Safety: We ensure the stream is only accessed from the thread that created it
-unsafe impl Send for StreamHandle {}
-unsafe impl Sync for StreamHandle {}
+impl CaptureOwner {
+    fn shutdown(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("Audio capture owner thread panicked during shutdown");
+            }
+        }
+    }
+}
+
+impl Drop for CaptureOwner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 impl AudioStreamer {
     pub fn new() -> Self {
@@ -88,7 +109,9 @@ impl AudioStreamer {
                 SAMPLE_RATE as usize * 30,
             ))),
             live_level_bits: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
-            stream_handle: Arc::new(Mutex::new(None)),
+            last_stream_release_ms: Arc::new(AtomicU64::new(0)),
+            lifecycle: Mutex::new(()),
+            capture_owner: Mutex::new(None),
             runtime: Arc::new(Mutex::new(RuntimeMetrics::default())),
         }
     }
@@ -201,196 +224,142 @@ impl AudioStreamer {
         })
     }
 
-    /// Start recording audio directly to internal buffer
+    /// Start recording audio directly to internal buffer.
+    ///
+    /// CPAL stream creation, lifetime, and destruction stay on one dedicated
+    /// owner thread. This avoids making `cpal::Stream` artificially Send/Sync
+    /// while keeping this synchronous API's startup errors deterministic.
     pub fn start_streaming(&self, preferred_device_name: Option<&str>) -> Result<(), String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.is_recording.load(Ordering::SeqCst) {
             return Err("Already recording".to_string());
         }
 
-        // Clear previous samples
         if let Ok(mut samples) = self.accumulated_samples.lock() {
             samples.clear();
         }
         self.live_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.update_runtime(AudioHealthPhase::Starting, None, None, false);
+        self.is_recording.store(true, Ordering::SeqCst);
 
         let is_recording = self.is_recording.clone();
         let accumulated = self.accumulated_samples.clone();
         let live_level = self.live_level_bits.clone();
-        let stream_handle = self.stream_handle.clone();
         let runtime = self.runtime.clone();
+        let preferred_device_name = preferred_device_name.map(str::to_owned);
+        let (started_tx, started_rx) = mpsc::sync_channel::<Result<(String, u32), String>>(1);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-        is_recording.store(true, Ordering::SeqCst);
+        let owner_thread = thread::Builder::new()
+            .name("listenos-audio-capture".to_string())
+            .spawn(move || {
+                let result = run_capture_owner(
+                    preferred_device_name.as_deref(),
+                    is_recording,
+                    accumulated,
+                    live_level,
+                    runtime,
+                    stop_rx,
+                    &started_tx,
+                );
+                if let Err(error) = result {
+                    let _ = started_tx.send(Err(error));
+                }
+            })
+            .map_err(|error| {
+                self.is_recording.store(false, Ordering::SeqCst);
+                let message = format!("Failed to start audio capture owner thread: {error}");
+                self.update_runtime(AudioHealthPhase::Error, None, Some(message.clone()), false);
+                message
+            })?;
 
-        // Build stream on current thread (important for macOS)
-        let host = cpal::default_host();
+        {
+            let mut owner = self
+                .capture_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *owner = Some(CaptureOwner {
+                stop_tx: Some(stop_tx),
+                thread: Some(owner_thread),
+            });
+        }
 
-        log::info!("Audio host: {}", host.id().name());
-
-        let device = match Self::select_input_device(&host, preferred_device_name) {
-            Ok(d) => d,
-            Err(e) => {
-                is_recording.store(false, Ordering::SeqCst);
-                return Err(e);
+        match started_rx.recv() {
+            Ok(Ok((device_name, sample_rate))) => {
+                log::info!(
+                    "Audio streaming started on '{}' at {} Hz",
+                    device_name,
+                    sample_rate
+                );
+                Ok(())
             }
-        };
-
-        let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-        log::info!("Using input device: {}", device_name);
-        self.update_runtime(
-            AudioHealthPhase::Starting,
-            Some(device_name.clone()),
-            None,
-            false,
-        );
-
-        // Use the device's native shared-mode format first; this is less likely to
-        // trigger routing changes or device lockups than forcing a custom capture format.
-        let supported_config = device
-            .default_input_config()
-            .map_err(|e| format!("Failed to get default input config: {}", e))?;
-
-        log::info!("Default config: {:?}", supported_config);
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.sample_rate_hz = supported_config.sample_rate().0;
+            Ok(Err(error)) => {
+                self.is_recording.store(false, Ordering::SeqCst);
+                self.release_capture_owner();
+                self.update_runtime(AudioHealthPhase::Error, None, Some(error.clone()), false);
+                Err(error)
+            }
+            Err(error) => {
+                self.is_recording.store(false, Ordering::SeqCst);
+                self.release_capture_owner();
+                let message = format!("Audio capture owner exited during startup: {error}");
+                self.update_runtime(AudioHealthPhase::Error, None, Some(message.clone()), false);
+                Err(message)
+            }
         }
-
-        let is_rec = is_recording.clone();
-        let acc = accumulated.clone();
-        let config: cpal::StreamConfig = supported_config.clone().into();
-
-        let build_stream =
-            |err_runtime: Arc<Mutex<RuntimeMetrics>>| match supported_config.sample_format() {
-                cpal::SampleFormat::F32 => device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        process_input_data(
-                            data,
-                            config.channels,
-                            is_rec.clone(),
-                            acc.clone(),
-                            live_level.clone(),
-                            runtime.clone(),
-                        );
-                    },
-                    move |err| {
-                        log::error!("Audio stream error: {}", err);
-                        if let Ok(mut runtime) = err_runtime.lock() {
-                            runtime.phase = AudioHealthPhase::Error;
-                            runtime.last_error = Some(err.to_string());
-                            runtime.phase_changed_ms = now_millis();
-                        }
-                    },
-                    None,
-                ),
-                cpal::SampleFormat::I16 => device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let converted: Vec<f32> =
-                            data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                        process_input_data(
-                            &converted,
-                            config.channels,
-                            is_rec.clone(),
-                            acc.clone(),
-                            live_level.clone(),
-                            runtime.clone(),
-                        );
-                    },
-                    move |err| {
-                        log::error!("Audio stream error: {}", err);
-                        if let Ok(mut runtime) = err_runtime.lock() {
-                            runtime.phase = AudioHealthPhase::Error;
-                            runtime.last_error = Some(err.to_string());
-                            runtime.phase_changed_ms = now_millis();
-                        }
-                    },
-                    None,
-                ),
-                cpal::SampleFormat::U16 => device.build_input_stream(
-                    &config,
-                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        let converted: Vec<f32> = data
-                            .iter()
-                            .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                            .collect();
-                        process_input_data(
-                            &converted,
-                            config.channels,
-                            is_rec.clone(),
-                            acc.clone(),
-                            live_level.clone(),
-                            runtime.clone(),
-                        );
-                    },
-                    move |err| {
-                        log::error!("Audio stream error: {}", err);
-                        if let Ok(mut runtime) = err_runtime.lock() {
-                            runtime.phase = AudioHealthPhase::Error;
-                            runtime.last_error = Some(err.to_string());
-                            runtime.phase_changed_ms = now_millis();
-                        }
-                    },
-                    None,
-                ),
-                _other => Err(cpal::BuildStreamError::StreamConfigNotSupported),
-            };
-
-        let stream = build_stream(self.runtime.clone()).map_err(|e| {
-            is_recording.store(false, Ordering::SeqCst);
-            self.update_runtime(
-                AudioHealthPhase::Error,
-                Some(device_name.clone()),
-                Some(format!("Failed to build audio stream: {e}")),
-                false,
-            );
-            format!(
-                "Failed to build audio stream: {}. Check microphone permissions.",
-                e
-            )
-        })?;
-
-        // Start the stream
-        stream.play().map_err(|e| {
-            is_recording.store(false, Ordering::SeqCst);
-            self.update_runtime(
-                AudioHealthPhase::Error,
-                Some(device_name.clone()),
-                Some(format!("Failed to start audio stream: {e}")),
-                false,
-            );
-            format!("Failed to start audio stream: {}", e)
-        })?;
-
-        // Store stream handle to keep it alive
-        if let Ok(mut handle) = stream_handle.lock() {
-            *handle = Some(StreamHandle { _stream: stream });
-        }
-
-        log::info!("Audio streaming started at {} Hz", config.sample_rate.0);
-
-        Ok(())
     }
 
-    /// Stop streaming
-    pub fn stop_streaming(&self) {
+    /// Stop capture and return whether a live stream owner actually had to be
+    /// released. Callers that are about to restart can use this to avoid the
+    /// Windows device-release grace period on the normal cold-start path.
+    pub fn stop_streaming(&self) -> bool {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.is_recording.store(false, Ordering::SeqCst);
         self.live_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
 
-        // Dropping the input stream releases the capture handle more reliably than
-        // pausing first on some Windows audio stacks.
-        let active_stream = self
-            .stream_handle
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        drop(active_stream);
+        // CaptureOwner::drop signals the owner and joins it. The CPAL stream is
+        // therefore dropped on its creator thread before we timestamp release.
+        let released_active_stream = self.release_capture_owner();
+        if released_active_stream {
+            self.last_stream_release_ms
+                .store(now_millis(), Ordering::Release);
+        }
 
         self.update_runtime(AudioHealthPhase::Idle, None, None, false);
 
         log::info!("Audio streaming stopped");
+        released_active_stream
+    }
+
+    fn release_capture_owner(&self) -> bool {
+        let active_owner = self
+            .capture_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let had_owner = active_owner.is_some();
+        drop(active_owner);
+        had_owner
+    }
+
+    /// Remaining device-release grace interval after the most recent real
+    /// stream drop. This keeps rapid stop -> start cycles reliable on Windows
+    /// without imposing a fixed delay on a cold start.
+    pub fn release_grace_remaining(&self, grace: Duration) -> Duration {
+        let released_at = self.last_stream_release_ms.load(Ordering::Acquire);
+        if released_at == 0 {
+            return Duration::ZERO;
+        }
+        let elapsed_ms = now_millis().saturating_sub(released_at);
+        grace.saturating_sub(Duration::from_millis(elapsed_ms))
     }
 
     /// Check if currently streaming
@@ -511,6 +480,146 @@ impl AudioStreamer {
     }
 }
 
+fn run_capture_owner(
+    preferred_device_name: Option<&str>,
+    is_recording: Arc<AtomicBool>,
+    accumulated: Arc<Mutex<Vec<f32>>>,
+    live_level: Arc<AtomicU32>,
+    runtime: Arc<Mutex<RuntimeMetrics>>,
+    stop_rx: mpsc::Receiver<()>,
+    started_tx: &mpsc::SyncSender<Result<(String, u32), String>>,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+    log::info!("Audio host: {}", host.id().name());
+
+    let device = AudioStreamer::select_input_device(&host, preferred_device_name)?;
+    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    log::info!("Using input device: {}", device_name);
+
+    // Use the device's native shared-mode format first; this is less likely to
+    // trigger routing changes or device lockups than forcing a custom format.
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| format!("Failed to get default input config: {error}"))?;
+    let sample_rate = supported_config.sample_rate().0;
+    let sample_format = supported_config.sample_format();
+    let config: cpal::StreamConfig = supported_config.into();
+    let channels = config.channels;
+    log::info!("Default input config: {:?}", config);
+
+    if let Ok(mut metrics) = runtime.lock() {
+        metrics.phase = AudioHealthPhase::Starting;
+        metrics.device_name = Some(device_name.clone());
+        metrics.last_error = None;
+        metrics.phase_changed_ms = now_millis();
+        metrics.sample_rate_hz = sample_rate;
+    }
+
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            let callback_recording = is_recording.clone();
+            let callback_accumulated = accumulated.clone();
+            let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
+            let error_runtime = runtime.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    process_input_data(
+                        data,
+                        channels,
+                        callback_recording.clone(),
+                        callback_accumulated.clone(),
+                        callback_level.clone(),
+                        callback_runtime.clone(),
+                    );
+                },
+                move |error| record_stream_error(&error_runtime, error.to_string()),
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let callback_recording = is_recording.clone();
+            let callback_accumulated = accumulated.clone();
+            let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
+            let error_runtime = runtime.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let converted = data
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect::<Vec<_>>();
+                    process_input_data(
+                        &converted,
+                        channels,
+                        callback_recording.clone(),
+                        callback_accumulated.clone(),
+                        callback_level.clone(),
+                        callback_runtime.clone(),
+                    );
+                },
+                move |error| record_stream_error(&error_runtime, error.to_string()),
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let callback_recording = is_recording.clone();
+            let callback_accumulated = accumulated.clone();
+            let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
+            let error_runtime = runtime.clone();
+            device.build_input_stream(
+                &config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let converted = data
+                        .iter()
+                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    process_input_data(
+                        &converted,
+                        channels,
+                        callback_recording.clone(),
+                        callback_accumulated.clone(),
+                        callback_level.clone(),
+                        callback_runtime.clone(),
+                    );
+                },
+                move |error| record_stream_error(&error_runtime, error.to_string()),
+                None,
+            )
+        }
+        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+    }
+    .map_err(|error| {
+        format!("Failed to build audio stream: {error}. Check microphone permissions.")
+    })?;
+
+    stream
+        .play()
+        .map_err(|error| format!("Failed to start audio stream: {error}"))?;
+
+    started_tx
+        .send(Ok((device_name, sample_rate)))
+        .map_err(|_| "Audio startup listener disconnected".to_string())?;
+
+    // Keep the stream local to this thread. A stop signal or sender disconnect
+    // ends the owner loop and drops the stream here, on the creator thread.
+    let _ = stop_rx.recv();
+    drop(stream);
+    Ok(())
+}
+
+fn record_stream_error(runtime: &Arc<Mutex<RuntimeMetrics>>, error: String) {
+    log::error!("Audio stream error: {}", error);
+    if let Ok(mut runtime) = runtime.lock() {
+        runtime.phase = AudioHealthPhase::Error;
+        runtime.last_error = Some(error);
+        runtime.phase_changed_ms = now_millis();
+    }
+}
+
 impl Default for AudioStreamer {
     fn default() -> Self {
         Self::new()
@@ -566,7 +675,7 @@ fn process_input_data(
         metrics.last_error = None;
     }
 
-    if let Ok(mut samples) = accumulated.try_lock() {
+    if let Ok(mut samples) = accumulated.lock() {
         samples.extend_from_slice(&mono);
     }
 }
@@ -576,4 +685,78 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_owner_shutdown_signals_and_joins_owner_thread() {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_on_thread = stopped.clone();
+        let thread = thread::spawn(move || {
+            let _ = stop_rx.recv();
+            stopped_on_thread.store(true, Ordering::Release);
+        });
+
+        let owner = CaptureOwner {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+        };
+        drop(owner);
+
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn input_callback_waits_for_sample_buffer_instead_of_dropping_audio() {
+        let is_recording = Arc::new(AtomicBool::new(true));
+        let accumulated = Arc::new(Mutex::new(Vec::new()));
+        let live_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let runtime = Arc::new(Mutex::new(RuntimeMetrics::default()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        let held_buffer = accumulated.lock().expect("sample buffer lock");
+        let callback_recording = is_recording.clone();
+        let callback_accumulated = accumulated.clone();
+        let callback_level = live_level.clone();
+        let callback_runtime = runtime.clone();
+        let callback = thread::spawn(move || {
+            entered_tx.send(()).expect("signal callback entry");
+            process_input_data(
+                &[0.2, -0.4, 0.6, -0.8],
+                2,
+                callback_recording,
+                callback_accumulated,
+                callback_level,
+                callback_runtime,
+            );
+            completed_tx.send(()).expect("signal callback completion");
+        });
+
+        entered_rx.recv().expect("callback entered");
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "callback must wait for the sample buffer rather than discard frames"
+        );
+        drop(held_buffer);
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback completed after buffer release");
+        callback.join().expect("callback thread");
+
+        let samples = accumulated.lock().expect("sample buffer");
+        assert_eq!(samples.len(), 2);
+        for sample in samples.iter() {
+            assert!(
+                (sample + 0.1).abs() < 1.0e-6,
+                "unexpected mono sample {sample}"
+            );
+        }
+    }
 }

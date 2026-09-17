@@ -19,13 +19,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Bump version files
-        run: npm run release:prepare -- "${{ inputs.version }}"
+        run: python3 scripts/version.py bump "${{ inputs.version }}"
 
       - name: Commit and tag
         env:
@@ -39,7 +34,7 @@ jobs:
             exit 1
           fi
 
-          git add package.json backend/Cargo.toml
+          git add backend/Cargo.toml backend/Cargo.lock native/Cargo.toml native/Cargo.lock
           git commit -m "chore(release): v${VERSION}"
           git tag "v${VERSION}"
           git push origin HEAD

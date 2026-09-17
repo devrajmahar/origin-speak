@@ -5,16 +5,19 @@
 pub mod custom;
 
 use crate::audio::AudioDevice;
-use crate::config::{LanguagePreferences, VibeActivationMode, VibeCodingConfig, VibeTargetTool};
+use crate::config::{
+    LanguagePreferences, VibeActivationMode, VibeCodingConfig, VibeFormattingStyle,
+};
 use crate::delivery::{
     capture_surface_snapshot, strategy_chain, verify_inserted_text, DeliveryPhase,
-    DeliveryStatusSnapshot, DeliveryStrategy,
+    DeliveryStatusSnapshot, DeliveryStrategy, DeliveryUpdate,
 };
 use crate::voice::{
     self, ActionResult, ActionType, ConversationContext, VoiceContext, VoiceMode, VoiceRouter,
 };
 use crate::{AppState, State};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 /// Status response for frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,15 +197,47 @@ fn normalized_vibe_coding_config(config: &VibeCodingConfig) -> VibeCodingConfig 
     normalized
 }
 
-fn vibe_target_tool_name(target_tool: VibeTargetTool) -> &'static str {
-    match target_tool {
-        VibeTargetTool::Generic => "Generic AI coding assistant",
-        VibeTargetTool::Cursor => "Cursor",
-        VibeTargetTool::Windsurf => "Windsurf",
-        VibeTargetTool::Claude => "Claude",
-        VibeTargetTool::ChatGPT => "ChatGPT",
-        VibeTargetTool::Copilot => "GitHub Copilot",
-    }
+fn is_low_signal_capture(rms: f32, peak: f32, active_ratio: f32) -> bool {
+    let weak_metrics = [rms < 0.0045, peak < 0.045, active_ratio < 0.018]
+        .into_iter()
+        .filter(|weak| *weak)
+        .count();
+    weak_metrics >= 2
+}
+
+fn should_suppress_stock_hallucination(text: &str, rms: f32, peak: f32, active_ratio: f32) -> bool {
+    const STOCK_PHRASES: &[&str] = &[
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "subscribe",
+        "like and subscribe",
+        "see you",
+        "bye",
+        "goodbye",
+        "you",
+        ".",
+        "..",
+        "...",
+    ];
+
+    let normalized = text
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '.' | ',' | '!' | '?' | ';' | ':' | '"' | '\'' | '…'
+                )
+        })
+        .to_lowercase();
+    let stock_phrase = STOCK_PHRASES.iter().any(|phrase| normalized == *phrase);
+    let weak_metrics = [rms < 0.008, peak < 0.10, active_ratio < 0.05]
+        .into_iter()
+        .filter(|weak| *weak)
+        .count();
+    stock_phrase && weak_metrics >= 2
 }
 
 fn strip_trigger_phrase_prefix(text: &str, trigger_phrase: &str) -> (String, bool) {
@@ -404,7 +439,7 @@ fn coding_prompt_signal_score(text: &str) -> u8 {
     score
 }
 
-fn should_apply_vibe_enhancement(
+fn should_format_vibe_coding_prompt(
     transcription_text: &str,
     context: &VoiceContext,
     vibe_config: &VibeCodingConfig,
@@ -446,15 +481,12 @@ fn should_apply_vibe_enhancement(
     let coding_prompt = coding_signal >= 2;
 
     let decision = match vibe_config.activation_mode {
-        VibeActivationMode::ManualOnly => trigger_detected.then_some("manual_trigger"),
-        VibeActivationMode::Always => Some("always"),
-        VibeActivationMode::SmartAuto => {
-            if trigger_detected {
-                Some("manual_trigger")
-            } else if coding_app_active && coding_signal >= 1 {
-                Some("coding_app_dynamic")
+        VibeActivationMode::TriggerPhrase => trigger_detected.then_some("trigger_phrase"),
+        VibeActivationMode::Automatic => {
+            if coding_app_active && coding_signal >= 1 {
+                Some("coding_context_app")
             } else if coding_prompt {
-                Some("coding_prompt_dynamic")
+                Some("coding_context_prompt")
             } else {
                 None
             }
@@ -464,19 +496,111 @@ fn should_apply_vibe_enhancement(
     decision.map(|reason| (source_text, reason))
 }
 
-async fn enhance_vibe_coding_prompt(
+fn split_vibe_prompt_segments(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        let boundary = if ch == '\n' {
+            Some(index)
+        } else if matches!(ch, '.' | '?' | '!')
+            && chars
+                .peek()
+                .map(|(_, next)| next.is_whitespace())
+                .unwrap_or(true)
+        {
+            Some(index + ch.len_utf8())
+        } else {
+            None
+        };
+
+        if let Some(end) = boundary {
+            let segment = text[start..end].trim();
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+            start = if ch == '\n' { index + 1 } else { end };
+        }
+    }
+
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        segments.push(tail);
+    }
+
+    segments
+}
+
+fn strip_vibe_leading_filler(segment: &str) -> &str {
+    // These forms include explicit pause punctuation from dictation. Keep the
+    // list conservative so words that could be identifiers or requirements are
+    // never removed merely because they resemble conversational filler.
+    const FILLERS: [&str; 8] = [
+        "um,",
+        "uh,",
+        "erm,",
+        "hmm,",
+        "um...",
+        "uh...",
+        "you know,",
+        "i mean,",
+    ];
+
+    let mut remaining = segment.trim_start();
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        let Some(filler) = FILLERS.iter().find(|filler| lower.starts_with(**filler)) else {
+            return remaining;
+        };
+        remaining = remaining[filler.len()..].trim_start();
+    }
+}
+
+fn cleaned_vibe_prompt_segments(text: &str) -> Vec<String> {
+    let mut cleaned = Vec::<String>::new();
+    for segment in split_vibe_prompt_segments(text) {
+        let segment = strip_vibe_leading_filler(segment).trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Exact adjacent repeats are a common dictation false start. Matching
+        // case-insensitively removes repetition without treating two merely
+        // similar requirements as equivalent.
+        if cleaned
+            .last()
+            .is_some_and(|previous| previous.eq_ignore_ascii_case(segment))
+        {
+            continue;
+        }
+        cleaned.push(segment.to_string());
+    }
+    cleaned
+}
+
+fn format_vibe_coding_prompt(
     original_text: &str,
-    language_preferences: &LanguagePreferences,
-    vibe_config: &VibeCodingConfig,
+    formatting: VibeFormattingStyle,
 ) -> Result<String, String> {
     let base = original_text.trim();
     if base.is_empty() {
-        return Err("Vibe enhancement skipped: empty text".to_string());
+        return Err("Vibe formatting skipped: empty text".to_string());
     }
 
-    let _ = language_preferences;
-    let _ = vibe_config;
-    Ok(base.to_string())
+    let segments = cleaned_vibe_prompt_segments(base);
+    if segments.is_empty() {
+        return Err("Vibe formatting skipped: no meaningful text".to_string());
+    }
+
+    match formatting {
+        VibeFormattingStyle::Natural => Ok(segments.join(" ")),
+        VibeFormattingStyle::Structured => Ok(segments
+            .into_iter()
+            .map(|segment| format!("- {segment}"))
+            .collect::<Vec<_>>()
+            .join("\n")),
+    }
 }
 
 // ============ Core Voice Commands ============
@@ -493,11 +617,14 @@ pub async fn start_listening(state: State<'_, AppState>) -> Result<bool, String>
     }
 
     // Ensure no stale input stream remains open from a prior interrupted session.
-    {
+    let release_grace = {
         let streamer = state.streamer.lock().await;
         streamer.stop_streaming();
+        streamer.release_grace_remaining(tokio::time::Duration::from_millis(120))
+    };
+    if !release_grace.is_zero() {
+        tokio::time::sleep(release_grace).await;
     }
-    tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
 
     if let Ok(mut delivery) = state.delivery.lock() {
         delivery.reset();
@@ -542,12 +669,26 @@ pub async fn cancel_listening(state: State<'_, AppState>) -> Result<bool, String
     Ok(true)
 }
 
-/// Stop listening and process audio
-pub async fn stop_listening(
+/// Audio snapshot taken synchronously on the command loop the moment the
+/// hold-to-talk shortcut is released. The slow transcription / routing /
+/// delivery stages run on a background task so the loop stays responsive to
+/// the next shortcut press while processing continues.
+#[derive(Debug, Clone)]
+pub struct CapturedAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+/// Fast, non-blocking capture teardown for shortcut release: flips the
+/// listening flag off, stops the audio stream, raises the processing flag,
+/// and snapshots the accumulated samples. This must stay cheap — the native
+/// command loop calls it synchronously and spawns the slow
+/// [`process_captured_audio`] work afterwards. Previously the loop awaited
+/// the full transcription inline, so a multi-second CPU inference blocked
+/// every later shortcut event and the overlay looked stuck in Processing.
+pub async fn take_capture_for_processing(
     state: State<'_, AppState>,
-    dictation_only: Option<bool>,
-) -> Result<VoiceProcessingResult, String> {
-    let dictation_only = dictation_only.unwrap_or(false);
+) -> Result<CapturedAudio, String> {
     // Check if listening
     {
         let is_listening = state.is_listening.lock().await;
@@ -574,7 +715,7 @@ pub async fn stop_listening(
         *is_processing = true;
     }
 
-    // Get accumulated audio
+    // Snapshot accumulated audio before any new capture can clear it.
     let (samples, sample_rate) = {
         let streamer = state.streamer.lock().await;
         (
@@ -582,6 +723,27 @@ pub async fn stop_listening(
             streamer.current_sample_rate(),
         )
     };
+
+    Ok(CapturedAudio {
+        samples,
+        sample_rate,
+    })
+}
+
+/// Slow voice-processing stages (silence gating, local transcription,
+/// intent routing, execution, delivery). Always clears the processing flag
+/// before returning. Runs on a spawned task via the native runtime.
+pub async fn process_captured_audio(
+    state: State<'_, AppState>,
+    captured: CapturedAudio,
+    dictation_only: Option<bool>,
+) -> Result<VoiceProcessingResult, String> {
+    let processing_started = Instant::now();
+    let dictation_only = dictation_only.unwrap_or(false);
+    let CapturedAudio {
+        samples,
+        sample_rate,
+    } = captured;
 
     // Calculate audio energy metrics to detect true silence and avoid hallucinated text.
     let rms: f32 = if samples.is_empty() {
@@ -619,7 +781,7 @@ pub async fn stop_listening(
 
     // Gate silence before local inference. Besides avoiding wasted CPU this prevents
     // Whisper from hallucinating stock phrases when the microphone captured only noise.
-    let is_low_signal = rms < 0.0028 && peak < 0.02 && active_ratio < 0.01;
+    let is_low_signal = is_low_signal_capture(rms, peak, active_ratio);
     if is_low_signal {
         log::info!(
             "No speech detected before transcription: rms={:.4}, peak={:.4}, active_ratio={:.4}",
@@ -674,6 +836,7 @@ pub async fn stop_listening(
         .transcription_language_hint()
         .map(|s| s.to_string());
 
+    let transcription_started = Instant::now();
     let mut transcription = {
         match state
             .transcription
@@ -707,25 +870,15 @@ pub async fn stop_listening(
             }
         }
     };
+    let transcription_ms = transcription_started.elapsed().as_millis();
 
-    // Also filter known Whisper hallucination phrases that appear on silence
-    let hallucination_phrases = [
-        "thank you",
-        "thanks",
-        "thanks for watching",
-        "thank you for watching",
-        "subscribe",
-        "like and subscribe",
-        "see you",
-        "bye",
-        "goodbye",
-        "you",
-        ".",
-        "..",
-        "...",
-    ];
     let text_lower = transcription.text.trim().to_lowercase();
-    let is_hallucination = hallucination_phrases.iter().any(|&p| text_lower == p);
+    // Whisper is known to emit stock phrases such as "thank you" on silence, but
+    // those are also perfectly valid things a person can actually say. Only
+    // suppress the stock phrase when the captured signal itself was weak. Strong
+    // speech must win over the heuristic.
+    let is_hallucination =
+        should_suppress_stock_hallucination(&text_lower, rms, peak, active_ratio);
     let repetitive_noise = {
         let words: Vec<&str> = text_lower
             .split_whitespace()
@@ -816,10 +969,7 @@ pub async fn stop_listening(
         // Add user message to conversation
         conversation.add_user_message(transcription.text.clone());
 
-        (
-            ConversationContext::default(),
-            conversation.session_id.clone(),
-        )
+        (ConversationContext, conversation.session_id.clone())
     };
 
     let local_router_action = voice::detect_local_command(&intent_text);
@@ -862,6 +1012,7 @@ pub async fn stop_listening(
         }
     };
 
+    let routing_started = Instant::now();
     let mut action = if dictation_only {
         log::info!(
             "Handsfree dictation mode active, bypassing intent routing and forcing TypeText"
@@ -936,24 +1087,21 @@ pub async fn stop_listening(
     }
 
     if !dictation_only && action.action_type == ActionType::TypeText {
-        let candidate_text = action
-            .refined_text
-            .clone()
-            .unwrap_or_else(|| transcription.text.clone());
-
         if let Some((vibe_input, activation_reason)) =
-            should_apply_vibe_enhancement(&candidate_text, &context, &vibe_config)
+            should_format_vibe_coding_prompt(&transcription.text, &context, &vibe_config)
         {
-            // Remove explicit trigger phrase from typed output even if enhancement fails.
+            // Vibe formatting starts from the raw transcription so generic
+            // dictation cleanup cannot discard a meaningful leading word. The
+            // explicit trigger phrase is removed from typed output even if
+            // formatting itself fails.
             action.refined_text = Some(vibe_input.clone());
 
-            match enhance_vibe_coding_prompt(&vibe_input, &language_preferences, &vibe_config).await
-            {
-                Ok(enhanced_prompt) => {
-                    action.refined_text = Some(enhanced_prompt);
+            match format_vibe_coding_prompt(&vibe_input, vibe_config.formatting) {
+                Ok(formatted_prompt) => {
+                    action.refined_text = Some(formatted_prompt);
                     upsert_action_payload_field(
                         &mut action,
-                        "vibe_enhanced",
+                        "vibe_formatted",
                         serde_json::Value::Bool(true),
                     );
                     upsert_action_payload_field(
@@ -963,23 +1111,22 @@ pub async fn stop_listening(
                     );
                     upsert_action_payload_field(
                         &mut action,
-                        "vibe_target_tool",
-                        serde_json::Value::String(
-                            vibe_target_tool_name(vibe_config.target_tool).to_string(),
-                        ),
+                        "vibe_formatting",
+                        serde_json::Value::String(format!("{:?}", vibe_config.formatting)),
                     );
                 }
                 Err(err) => {
-                    log::warn!("Vibe prompt enhancement skipped due to error: {}", err);
+                    log::warn!("Vibe prompt formatting skipped due to error: {}", err);
                     upsert_action_payload_field(
                         &mut action,
-                        "vibe_enhancement_error",
+                        "vibe_formatting_error",
                         serde_json::Value::String(err),
                     );
                 }
             }
         }
     }
+    let routing_ms = routing_started.elapsed().as_millis();
 
     let confirms_enabled = confirmations_enabled();
     let should_confirm_action =
@@ -1019,6 +1166,7 @@ pub async fn stop_listening(
     }
 
     // Execute immediately only for non-risky actions.
+    let execution_started = Instant::now();
     let execute_result = if requires_confirmation {
         Ok(CommandResult {
             success: true,
@@ -1028,6 +1176,7 @@ pub async fn stop_listening(
     } else {
         execute_action_internal(&action, &state).await
     };
+    let execution_ms = execution_started.elapsed().as_millis();
 
     if !requires_confirmation {
         match &execute_result {
@@ -1181,7 +1330,43 @@ pub async fn stop_listening(
         *is_processing = false;
     }
 
+    log::info!(
+        "Voice processing timing: capture_ms={}, transcription_ms={}, routing_ms={}, execution_ms={}, total_ms={}, action={:?}, transcript_chars={}",
+        duration_ms,
+        transcription_ms,
+        routing_ms,
+        execution_ms,
+        processing_started.elapsed().as_millis(),
+        action.action_type,
+        result.transcription.text.chars().count()
+    );
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[ListenOS timing] processing capture_ms={} transcription_ms={} routing_ms={} execution_ms={} total_ms={} action={:?} transcript_chars={}",
+        duration_ms,
+        transcription_ms,
+        routing_ms,
+        execution_ms,
+        processing_started.elapsed().as_millis(),
+        action.action_type,
+        result.transcription.text.chars().count()
+    );
+
     Ok(result)
+}
+
+/// Stop listening and process audio.
+///
+/// Convenience wrapper that performs the fast capture teardown and then the
+/// slow processing stages inline. The native runtime prefers
+/// [`take_capture_for_processing`] + spawned [`process_captured_audio`] so a
+/// long transcription never blocks the shortcut command loop.
+pub async fn stop_listening(
+    state: State<'_, AppState>,
+    dictation_only: Option<bool>,
+) -> Result<VoiceProcessingResult, String> {
+    let captured = take_capture_for_processing(State::new(&*state)).await?;
+    process_captured_audio(state, captured, dictation_only).await
 }
 
 /// Get current application status
@@ -1305,8 +1490,20 @@ pub async fn set_audio_device(
         );
     }
 
-    let mut audio = state.audio.lock().await;
-    audio.selected_device = Some(cleaned_name.to_string());
+    let available = crate::audio::AudioState::get_devices()?;
+    if !available.iter().any(|device| device.name == cleaned_name) {
+        return Err(format!(
+            "Audio input device is no longer available: {cleaned_name}"
+        ));
+    }
+
+    let _update_guard = state.config_update_lock.lock().await;
+    let mut next_config = {
+        let config = state.config.lock().await;
+        config.clone()
+    };
+    next_config.selected_audio_device = Some(cleaned_name.to_string());
+    commit_config(&state, next_config).await?;
     log::info!("Set audio device to {}", cleaned_name);
     Ok(true)
 }
@@ -1992,11 +2189,7 @@ async fn execute_action_internal(
 
                 if let Some((_, primary_cmd, web_fallback)) = app_info {
                     // Try primary command first
-                    let launch_cmd = if primary_cmd.contains("://") || primary_cmd.ends_with(':') {
-                        format!("start {}", primary_cmd)
-                    } else {
-                        format!("start {}", primary_cmd)
-                    };
+                    let launch_cmd = format!("start {}", primary_cmd);
 
                     let result = Command::new("cmd").args(["/C", &launch_cmd]).output();
 
@@ -2497,15 +2690,15 @@ async fn type_text_internal(
         .unwrap_or_else(|| "focused application".to_string());
 
     update_delivery_state(state, |delivery| {
-        delivery.update(
-            DeliveryPhase::Preparing,
+        delivery.update(DeliveryUpdate {
+            phase: DeliveryPhase::Preparing,
             surface,
-            target_label.clone(),
-            None,
-            0,
-            format!("Targeting {}", target_name.clone()),
-            false,
-        );
+            target: target_label.clone(),
+            strategy: None,
+            attempts: 0,
+            summary: format!("Targeting {}", target_name.clone()),
+            recovered_to_clipboard: false,
+        });
     });
 
     let strategies = strategy_chain(surface, &before, &text);
@@ -2516,6 +2709,8 @@ async fn type_text_internal(
 
     let mut last_error: Option<String> = None;
     let mut last_result: Option<CommandResult> = None;
+    let mut attempted_strategy: Option<DeliveryStrategy> = None;
+    let mut attempts_made = 0_u8;
 
     for (index, strategy) in strategies.iter().enumerate() {
         let attempt = (index + 1) as u8;
@@ -2526,15 +2721,15 @@ async fn type_text_internal(
         };
 
         update_delivery_state(state, |delivery| {
-            delivery.update(
+            delivery.update(DeliveryUpdate {
                 phase,
                 surface,
-                target_label.clone(),
-                Some(*strategy),
-                attempt,
-                format!("Trying {} for {}", strategy.label(), target_name.clone()),
-                false,
-            );
+                target: target_label.clone(),
+                strategy: Some(*strategy),
+                attempts: attempt,
+                summary: format!("Trying {} for {}", strategy.label(), target_name.clone()),
+                recovered_to_clipboard: false,
+            });
         });
 
         if !matches!(strategy, DeliveryStrategy::SimulatedTyping) {
@@ -2548,73 +2743,83 @@ async fn type_text_internal(
             }
         }
 
+        // Once an input strategy is actually dispatched, do not automatically
+        // try another one. Verification can be inconclusive on browser/editor
+        // accessibility surfaces even when the first paste succeeded; retrying
+        // in that state is how the same transcription can be inserted twice.
+        attempted_strategy = Some(*strategy);
+        attempts_made = attempts_made.saturating_add(1);
         if let Err(err) = perform_delivery_strategy(*strategy, &text) {
             last_error = Some(err);
-            continue;
+            break;
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         update_delivery_state(state, |delivery| {
-            delivery.update(
-                DeliveryPhase::Verifying,
+            delivery.update(DeliveryUpdate {
+                phase: DeliveryPhase::Verifying,
                 surface,
-                target_label.clone(),
-                Some(*strategy),
-                attempt,
-                format!("Verifying {} delivery", strategy.label()),
-                false,
-            );
+                target: target_label.clone(),
+                strategy: Some(*strategy),
+                attempts: attempt,
+                summary: format!("Verifying {} delivery", strategy.label()),
+                recovered_to_clipboard: false,
+            });
         });
 
         let after = capture_surface_snapshot(4096);
         let verified = verify_inserted_text(&before, &after, &text);
         let readback_unavailable = !before.supports_readback() || !after.supports_readback();
 
-        if verified || readback_unavailable {
-            if let Some(clipboard) = clipboard.as_mut() {
-                restore_previous_clipboard(clipboard, previous_clipboard.as_ref());
-            }
-
-            let message = if verified {
-                format!(
-                    "Delivered text to {} via {}",
-                    target_name.clone(),
-                    strategy.label()
-                )
-            } else {
-                format!(
-                    "Delivered text to {} via {} (unverified)",
-                    target_name.clone(),
-                    strategy.label()
-                )
-            };
-
-            update_delivery_state(state, |delivery| {
-                delivery.update(
-                    DeliveryPhase::Succeeded,
-                    surface,
-                    target_label.clone(),
-                    Some(*strategy),
-                    attempt,
-                    message.clone(),
-                    false,
-                );
-            });
-
-            last_result = Some(CommandResult {
-                success: true,
-                message,
-                output: None,
-            });
-            break;
+        // A successful input dispatch is authoritative. Accessibility/UIA
+        // readback can lag or expose only a partial document snapshot even
+        // when the target application already accepted the paste. Treat that
+        // verification as diagnostic only; converting an inconclusive
+        // snapshot into a failure produces a false red error after text has
+        // visibly appeared and previously encouraged duplicate retries.
+        if let Some(clipboard) = clipboard.as_mut() {
+            restore_previous_clipboard(clipboard, previous_clipboard.as_ref());
         }
 
-        last_error = Some(format!(
-            "{} did not change the focused input for {}",
-            strategy.label(),
-            target_name.clone()
-        ));
+        let message = if verified {
+            format!(
+                "Delivered text to {} via {}",
+                target_name.clone(),
+                strategy.label()
+            )
+        } else if readback_unavailable {
+            format!(
+                "Delivered text to {} via {} (readback unavailable)",
+                target_name.clone(),
+                strategy.label()
+            )
+        } else {
+            format!(
+                "Delivered text to {} via {} (readback inconclusive)",
+                target_name.clone(),
+                strategy.label()
+            )
+        };
+
+        update_delivery_state(state, |delivery| {
+            delivery.update(DeliveryUpdate {
+                phase: DeliveryPhase::Succeeded,
+                surface,
+                target: target_label.clone(),
+                strategy: Some(*strategy),
+                attempts: attempt,
+                summary: message.clone(),
+                recovered_to_clipboard: false,
+            });
+        });
+
+        last_result = Some(CommandResult {
+            success: true,
+            message,
+            output: None,
+        });
+        break;
     }
 
     if let Some(result) = last_result {
@@ -2644,15 +2849,15 @@ async fn type_text_internal(
             failure_message.clone(),
             recovered_to_clipboard,
         );
-        delivery.update(
-            DeliveryPhase::RecoverableFailure,
+        delivery.update(DeliveryUpdate {
+            phase: DeliveryPhase::RecoverableFailure,
             surface,
-            target_label.clone(),
-            strategies.last().copied(),
-            strategies.len() as u8,
-            failure_message.clone(),
+            target: target_label.clone(),
+            strategy: attempted_strategy,
+            attempts: attempts_made,
+            summary: failure_message.clone(),
             recovered_to_clipboard,
-        );
+        });
     });
 
     Err(match last_error {
@@ -3422,7 +3627,9 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<crate::config::App
     Ok(config.clone())
 }
 
-pub(crate) fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
+/// Normalize a user-facing shortcut string into the canonical spelling shared
+/// by native frontends and the global-hotkey adapter.
+pub fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
     let cleaned = raw.trim();
     if cleaned.is_empty() {
         return Err("Hotkey cannot be empty".to_string());
@@ -3442,7 +3649,7 @@ pub(crate) fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
             "ctrl" | "control" => Some("Ctrl".to_string()),
             "alt" | "option" => Some("Alt".to_string()),
             "shift" => Some("Shift".to_string()),
-            "win" | "meta" | "super" | "cmd" | "command" => Some("Meta".to_string()),
+            "win" | "windows" | "meta" | "super" | "cmd" | "command" => Some("Meta".to_string()),
             "spacebar" | "space" => None,
             _ => None,
         };
@@ -3480,15 +3687,16 @@ pub(crate) fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
     Ok(parts.join("+"))
 }
 
-fn validate_distinct_hotkeys(trigger_hotkey: &str, assistant_hotkey: &str) -> Result<(), String> {
+/// Validate the two application-wide shortcut bindings without mutating state.
+pub fn validate_hotkey_pair(trigger_hotkey: &str, assistant_hotkey: &str) -> Result<(), String> {
     if trigger_hotkey.eq_ignore_ascii_case(assistant_hotkey) {
         return Err("Assistant shortcut must be different from hold-to-talk shortcut".to_string());
     }
     Ok(())
 }
 
-pub async fn set_config(
-    state: State<'_, crate::AppState>,
+async fn commit_config(
+    state: &crate::AppState,
     config: crate::config::AppConfig,
 ) -> Result<bool, String> {
     let mut config = config;
@@ -3497,32 +3705,54 @@ pub async fn set_config(
     config.language_preferences = normalized_language_preferences(&config.language_preferences);
     config.vibe_coding = normalized_vibe_coding_config(&config.vibe_coding);
 
-    let mut current_config = state.config.lock().await;
-
-    if current_config.trigger_hotkey != config.trigger_hotkey
-        || current_config.assistant_hotkey != config.assistant_hotkey
-    {
-        let new_trigger = config.trigger_hotkey.clone();
-        let new_assistant = config.assistant_hotkey.clone();
-
+    let (old_trigger, old_assistant, old_use_gpu) = {
+        let current_config = state.config.lock().await;
+        (
+            current_config.trigger_hotkey.clone(),
+            current_config.assistant_hotkey.clone(),
+            current_config.use_gpu,
+        )
+    };
+    if old_trigger != config.trigger_hotkey || old_assistant != config.assistant_hotkey {
         log::info!(
             "Updating hotkeys from hold='{}', assistant='{}' to hold='{}', assistant='{}'",
-            current_config.trigger_hotkey,
-            current_config.assistant_hotkey,
-            new_trigger,
-            new_assistant
+            old_trigger,
+            old_assistant,
+            config.trigger_hotkey,
+            config.assistant_hotkey
         );
-        validate_distinct_hotkeys(&new_trigger, &new_assistant)?;
+        validate_hotkey_pair(&config.trigger_hotkey, &config.assistant_hotkey)?;
     }
 
-    *current_config = config;
-    if let Err(err) = current_config.language_preferences.save_to_disk() {
+    // Persist before replacing the live state so a disk failure cannot leave a
+    // value that appears saved for this session but disappears after restart.
+    config.save_to_disk()?;
+    {
+        let mut current_config = state.config.lock().await;
+        *current_config = config.clone();
+    }
+    {
+        let mut audio = state.audio.lock().await;
+        audio.selected_device = config.selected_audio_device.clone();
+    }
+    if old_use_gpu != config.use_gpu {
+        state.transcription.set_gpu_enabled(config.use_gpu);
+    }
+    if let Err(err) = config.language_preferences.save_to_disk() {
         log::warn!("Failed to persist language preferences: {}", err);
     }
-    if let Err(err) = current_config.vibe_coding.save_to_disk() {
+    if let Err(err) = config.vibe_coding.save_to_disk() {
         log::warn!("Failed to persist vibe coding config: {}", err);
     }
     Ok(true)
+}
+
+pub async fn set_config(
+    state: State<'_, crate::AppState>,
+    config: crate::config::AppConfig,
+) -> Result<bool, String> {
+    let _update_guard = state.config_update_lock.lock().await;
+    commit_config(&state, config).await
 }
 
 pub async fn get_trigger_hotkey(state: State<'_, AppState>) -> Result<String, String> {
@@ -3535,14 +3765,14 @@ pub async fn set_trigger_hotkey(
     hotkey: String,
 ) -> Result<String, String> {
     let normalized_trigger = normalize_hotkey_string(&hotkey)?;
-    let assistant_hotkey = {
+    let _update_guard = state.config_update_lock.lock().await;
+    let mut next_config = {
         let config = state.config.lock().await;
-        config.assistant_hotkey.clone()
+        config.clone()
     };
-    validate_distinct_hotkeys(&normalized_trigger, &assistant_hotkey)?;
-
-    let mut config = state.config.lock().await;
-    config.trigger_hotkey = normalized_trigger.clone();
+    validate_hotkey_pair(&normalized_trigger, &next_config.assistant_hotkey)?;
+    next_config.trigger_hotkey = normalized_trigger.clone();
+    commit_config(&state, next_config).await?;
     Ok(normalized_trigger)
 }
 
@@ -3556,14 +3786,14 @@ pub async fn set_assistant_hotkey(
     hotkey: String,
 ) -> Result<String, String> {
     let normalized_assistant = normalize_hotkey_string(&hotkey)?;
-    let trigger_hotkey = {
+    let _update_guard = state.config_update_lock.lock().await;
+    let mut next_config = {
         let config = state.config.lock().await;
-        config.trigger_hotkey.clone()
+        config.clone()
     };
-    validate_distinct_hotkeys(&trigger_hotkey, &normalized_assistant)?;
-
-    let mut config = state.config.lock().await;
-    config.assistant_hotkey = normalized_assistant.clone();
+    validate_hotkey_pair(&next_config.trigger_hotkey, &normalized_assistant)?;
+    next_config.assistant_hotkey = normalized_assistant.clone();
+    commit_config(&state, next_config).await?;
     Ok(normalized_assistant)
 }
 
@@ -3586,11 +3816,13 @@ pub async fn set_language_preferences(
         target_language: normalize_language_code(&target_language, false),
     };
 
-    let mut config = state.config.lock().await;
-    config.language_preferences = normalized.clone();
-    if let Err(err) = config.language_preferences.save_to_disk() {
-        log::warn!("Failed to persist language preferences: {}", err);
-    }
+    let _update_guard = state.config_update_lock.lock().await;
+    let mut next_config = {
+        let config = state.config.lock().await;
+        config.clone()
+    };
+    next_config.language_preferences = normalized.clone();
+    commit_config(&state, next_config).await?;
     Ok(normalized)
 }
 
@@ -3606,13 +3838,13 @@ pub async fn set_vibe_coding_config(
     config: VibeCodingConfig,
 ) -> Result<VibeCodingConfig, String> {
     let normalized = normalized_vibe_coding_config(&config);
-
-    let mut app_config = state.config.lock().await;
-    app_config.vibe_coding = normalized.clone();
-    if let Err(err) = app_config.vibe_coding.save_to_disk() {
-        log::warn!("Failed to persist vibe coding config: {}", err);
-    }
-
+    let _update_guard = state.config_update_lock.lock().await;
+    let mut next_config = {
+        let app_config = state.config.lock().await;
+        app_config.clone()
+    };
+    next_config.vibe_coding = normalized.clone();
+    commit_config(&state, next_config).await?;
     Ok(normalized)
 }
 
@@ -3627,6 +3859,37 @@ pub async fn get_custom_commands() -> Result<Vec<custom::CustomCommand>, String>
 /// Get built-in command templates
 pub async fn get_command_templates() -> Result<Vec<custom::CustomCommand>, String> {
     Ok(custom::get_builtin_templates())
+}
+
+/// Materialize a built-in template as a fresh enabled custom command.
+///
+/// Keeping this in the backend avoids making each native frontend reimplement
+/// identity/timestamp initialization when onboarding installs templates.
+pub async fn install_command_template(
+    template_id: String,
+) -> Result<custom::CustomCommand, String> {
+    let template = custom::get_builtin_templates()
+        .into_iter()
+        .find(|template| template.id == template_id)
+        .ok_or_else(|| format!("Unknown command template: {template_id}"))?;
+
+    let store = custom::CustomCommandsStore::new()?;
+    if let Some(existing) = store.get_all_commands()?.into_iter().find(|command| {
+        command
+            .trigger_phrase
+            .eq_ignore_ascii_case(&template.trigger_phrase)
+    }) {
+        return Ok(existing);
+    }
+
+    let mut command = template;
+    command.id = uuid::Uuid::new_v4().to_string();
+    command.enabled = true;
+    command.created_at = chrono::Utc::now();
+    command.last_used = None;
+    command.use_count = 0;
+    store.save_command(&command)?;
+    Ok(command)
 }
 
 /// Save a custom command
@@ -3657,4 +3920,378 @@ pub async fn export_custom_commands() -> Result<String, String> {
 pub async fn import_custom_commands(json: String) -> Result<usize, String> {
     let store = custom::CustomCommandsStore::new()?;
     store.import_commands(&json)
+}
+
+// ============ History Commands ============
+
+pub async fn get_history(state: State<'_, AppState>) -> Result<Vec<VoiceProcessingResult>, String> {
+    Ok(state.history.lock().await.clone())
+}
+
+pub async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    state.history.lock().await.clear();
+    Ok(())
+}
+
+// ============ Notes Commands ============
+
+pub async fn get_notes(limit: Option<usize>) -> Result<Vec<crate::Note>, String> {
+    crate::NotesStore::new()?.get_all_notes(limit)
+}
+
+pub async fn create_note(content: String) -> Result<crate::Note, String> {
+    crate::NotesStore::new()?.create_note(content)
+}
+
+pub async fn update_note(id: String, content: String) -> Result<(), String> {
+    crate::NotesStore::new()?.update_note(&id, content)
+}
+
+pub async fn delete_note(id: String) -> Result<(), String> {
+    crate::NotesStore::new()?.delete_note(&id)
+}
+
+pub async fn toggle_note_pin(id: String) -> Result<bool, String> {
+    crate::NotesStore::new()?.toggle_pin(&id)
+}
+
+/// Transcribe the current captured recording and persist it as a note.
+///
+/// Kept alongside the other typed backend commands so the native frontend can
+/// create voice notes through the same application core as other operations.
+pub async fn create_voice_note(state: State<'_, AppState>) -> Result<crate::Note, String> {
+    let (samples, sample_rate) = {
+        let streamer = state.streamer.lock().await;
+        (
+            streamer.get_accumulated_samples(),
+            streamer.current_sample_rate(),
+        )
+    };
+    let minimum_samples = (sample_rate as usize / 10).max(1);
+    if samples.len() < minimum_samples {
+        return Err("Recording too short".to_string());
+    }
+
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    let active_ratio =
+        samples.iter().filter(|sample| sample.abs() > 0.012).count() as f32 / samples.len() as f32;
+    if is_low_signal_capture(rms, peak, active_ratio) {
+        return Err("No speech detected".to_string());
+    }
+
+    let (language, dictionary_hints) = {
+        let config = state.config.lock().await;
+        let language = config
+            .language_preferences
+            .transcription_language_hint()
+            .map(str::to_string);
+        let dictionary_hints = crate::DictionaryStore::new()
+            .and_then(|store| store.get_words_for_recognition())
+            .unwrap_or_default();
+        (language, dictionary_hints)
+    };
+
+    let result = state
+        .transcription
+        .transcribe(samples, sample_rate, language, dictionary_hints)
+        .await?;
+    let text = result.trim();
+    if text.is_empty() {
+        return Err("No speech detected".to_string());
+    }
+    crate::NotesStore::new()?.create_note(text.to_string())
+}
+
+// ============ Snippet Commands ============
+
+pub async fn get_snippets() -> Result<Vec<crate::Snippet>, String> {
+    crate::SnippetsStore::new()?.get_all_snippets()
+}
+
+pub async fn create_snippet(trigger: String, expansion: String) -> Result<crate::Snippet, String> {
+    crate::SnippetsStore::new()?.create_snippet(trigger, expansion)
+}
+
+pub async fn update_snippet(id: String, trigger: String, expansion: String) -> Result<(), String> {
+    crate::SnippetsStore::new()?.update_snippet(&id, trigger, expansion)
+}
+
+pub async fn delete_snippet(id: String) -> Result<(), String> {
+    crate::SnippetsStore::new()?.delete_snippet(&id)
+}
+
+// ============ Dictionary Commands ============
+
+pub async fn get_dictionary_words() -> Result<Vec<crate::DictionaryWord>, String> {
+    crate::DictionaryStore::new()?.get_all_words()
+}
+
+pub async fn add_dictionary_word(
+    word: String,
+    is_auto_learned: bool,
+) -> Result<crate::DictionaryWord, String> {
+    crate::DictionaryStore::new()?.add_word(word, is_auto_learned)
+}
+
+pub async fn update_dictionary_word(
+    id: String,
+    word: String,
+    phonetic: Option<String>,
+) -> Result<(), String> {
+    crate::DictionaryStore::new()?.update_word(&id, word, phonetic)
+}
+
+pub async fn delete_dictionary_word(id: String) -> Result<(), String> {
+    crate::DictionaryStore::new()?.delete_word(&id)
+}
+
+// ============ Error Commands ============
+
+pub async fn get_errors(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::ErrorEntry>, String> {
+    Ok(state.error_log.lock().await.get_recent(limit.unwrap_or(20)))
+}
+
+pub async fn get_undismissed_errors(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::ErrorEntry>, String> {
+    Ok(state.error_log.lock().await.get_undismissed())
+}
+
+pub async fn dismiss_error(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    Ok(state.error_log.lock().await.dismiss(&id))
+}
+
+pub async fn dismiss_all_errors(state: State<'_, AppState>) -> Result<(), String> {
+    state.error_log.lock().await.dismiss_all();
+    Ok(())
+}
+
+// ============ Correction Commands ============
+
+/// Learn dictionary entries inferred from a user's correction.
+///
+/// Returns the newly learned words. Transport adapters may turn these into
+/// notifications, while a native frontend can react to the typed values.
+pub async fn learn_correction(
+    state: State<'_, AppState>,
+    corrected_text: String,
+) -> Result<Vec<String>, String> {
+    let corrections = state
+        .correction_tracker
+        .lock()
+        .await
+        .detect_corrections(&corrected_text);
+    let store = crate::DictionaryStore::new()?;
+    let mut learned = Vec::new();
+    for (_, corrected) in corrections {
+        if !store.word_exists(&corrected)? {
+            store.add_word(corrected.clone(), true)?;
+            learned.push(corrected);
+        }
+    }
+    Ok(learned)
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::{
+        format_vibe_coding_prompt, is_low_signal_capture, normalize_hotkey_string,
+        should_format_vibe_coding_prompt, should_suppress_stock_hallucination,
+        validate_hotkey_pair,
+    };
+    use crate::config::{VibeActivationMode, VibeCodingConfig, VibeFormattingStyle};
+    use crate::voice::VoiceContext;
+
+    #[test]
+    fn hotkeys_normalize_without_mutating_application_state() {
+        assert_eq!(
+            normalize_hotkey_string(" control + shift + spacebar ").unwrap(),
+            "Ctrl+Shift+Space"
+        );
+        assert_eq!(normalize_hotkey_string("cmd+K").unwrap(), "Meta+K");
+        assert_eq!(
+            normalize_hotkey_string("windows + ctrl + space").unwrap(),
+            "Meta+Ctrl+Space"
+        );
+        assert!(normalize_hotkey_string("ctrl + win").is_err());
+    }
+
+    #[test]
+    fn application_hotkeys_must_remain_distinct() {
+        assert!(validate_hotkey_pair("Ctrl+Space", "Ctrl+Alt+Space").is_ok());
+        assert!(validate_hotkey_pair("Ctrl+Space", "ctrl+space").is_err());
+    }
+
+    #[test]
+    fn stock_whisper_phrases_are_only_suppressed_for_weak_audio() {
+        assert!(should_suppress_stock_hallucination(
+            "thank you",
+            0.001,
+            0.01,
+            0.002
+        ));
+        assert!(!should_suppress_stock_hallucination(
+            "thank you",
+            0.025,
+            0.22,
+            0.15
+        ));
+        assert!(!should_suppress_stock_hallucination(
+            "hello", 0.001, 0.01, 0.002
+        ));
+        assert!(should_suppress_stock_hallucination(
+            "Thank you.",
+            0.006,
+            0.12,
+            0.01
+        ));
+        assert!(!should_suppress_stock_hallucination(
+            "Thank you!",
+            0.009,
+            0.14,
+            0.08
+        ));
+    }
+
+    #[test]
+    fn silence_gate_tolerates_single_noise_spikes_but_keeps_real_speech() {
+        assert!(is_low_signal_capture(0.003, 0.12, 0.006));
+        assert!(is_low_signal_capture(0.006, 0.03, 0.008));
+        assert!(!is_low_signal_capture(0.007, 0.11, 0.05));
+    }
+
+    #[test]
+    fn vibe_trigger_phrase_mode_does_not_auto_activate_in_coding_apps() {
+        let config = VibeCodingConfig {
+            enabled: true,
+            activation_mode: VibeActivationMode::TriggerPhrase,
+            trigger_phrase: "vibe".to_string(),
+            formatting: VibeFormattingStyle::Natural,
+        };
+        let context = VoiceContext {
+            active_app: Some("Cursor".to_string()),
+            ..VoiceContext::default()
+        };
+
+        assert!(should_format_vibe_coding_prompt(
+            "fix the rust compile error in the parser",
+            &context,
+            &config
+        )
+        .is_none());
+
+        let activated = should_format_vibe_coding_prompt(
+            "vibe: fix the rust compile error in the parser",
+            &context,
+            &config,
+        )
+        .expect("trigger phrase should activate formatting");
+        assert_eq!(activated.0, "fix the rust compile error in the parser");
+        assert_eq!(activated.1, "trigger_phrase");
+
+        let mut disabled = config.clone();
+        disabled.enabled = false;
+        assert!(should_format_vibe_coding_prompt(
+            "vibe: fix the rust compile error in the parser",
+            &context,
+            &disabled,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn vibe_automatic_mode_ignores_non_coding_dictation() {
+        let config = VibeCodingConfig {
+            enabled: true,
+            activation_mode: VibeActivationMode::Automatic,
+            trigger_phrase: "vibe".to_string(),
+            formatting: VibeFormattingStyle::Structured,
+        };
+        let context = VoiceContext {
+            active_app: Some("Visual Studio Code".to_string()),
+            ..VoiceContext::default()
+        };
+
+        assert!(
+            should_format_vibe_coding_prompt("thanks for checking this", &context, &config)
+                .is_none()
+        );
+        assert!(should_format_vibe_coding_prompt(
+            "fix the rust compile error in the parser",
+            &VoiceContext::default(),
+            &config,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn vibe_structured_format_preserves_negatives_uncertainty_and_requirements() {
+        let input = "Do not delete existing migrations. Maybe reuse the parser if it is safe? Keep --locked exactly as requested.";
+        let formatted = format_vibe_coding_prompt(input, VibeFormattingStyle::Structured)
+            .expect("structured formatting");
+
+        assert_eq!(
+            formatted,
+            "- Do not delete existing migrations.\n- Maybe reuse the parser if it is safe?\n- Keep --locked exactly as requested."
+        );
+        let recovered = formatted
+            .lines()
+            .map(|line| line.strip_prefix("- ").expect("structured bullet"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(recovered, input);
+
+        for injected in [
+            "Constraints:",
+            "Acceptance Criteria:",
+            "Tests:",
+            "Cursor",
+            "Claude",
+            "ChatGPT",
+        ] {
+            assert!(
+                !formatted.contains(injected),
+                "injected content: {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn vibe_natural_format_preserves_meaning_while_removing_clear_spoken_noise() {
+        let input = "  Maybe keep this as-is, and do not add tests I did not request.  ";
+        let formatted = format_vibe_coding_prompt(input, VibeFormattingStyle::Natural)
+            .expect("natural formatting");
+        assert_eq!(
+            formatted,
+            "Maybe keep this as-is, and do not add tests I did not request."
+        );
+
+        let dictated = "Um, do not change src/lib.rs. Do not change src/lib.rs. Uh, maybe use gpui-base if it already fits?";
+        let structured = format_vibe_coding_prompt(dictated, VibeFormattingStyle::Structured)
+            .expect("structured spoken cleanup");
+        assert_eq!(
+            structured,
+            "- do not change src/lib.rs.\n- maybe use gpui-base if it already fits?"
+        );
+
+        for meaningful_leading_word in [
+            "LikeButton should keep its existing API.",
+            "So should remain the variable name.",
+            "WellKnownType must not be renamed.",
+        ] {
+            assert_eq!(
+                format_vibe_coding_prompt(meaningful_leading_word, VibeFormattingStyle::Natural)
+                    .expect("meaningful leading word"),
+                meaningful_leading_word
+            );
+        }
+    }
 }

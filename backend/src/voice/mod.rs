@@ -180,7 +180,109 @@ fn post_process_dictation(text: &str) -> String {
         }
     }
 
-    result
+    organize_long_instruction_dictation(&result)
+}
+
+fn split_dictation_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if matches!(ch, '.' | '?' | '!')
+            && chars
+                .peek()
+                .map(|(_, next)| next.is_whitespace())
+                .unwrap_or(true)
+        {
+            let end = index + ch.len_utf8();
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_string());
+            }
+            start = end;
+        }
+    }
+
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        sentences.push(tail.to_string());
+    }
+    sentences
+}
+
+fn normalized_sentence_key(sentence: &str) -> String {
+    sentence
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn organize_long_instruction_dictation(text: &str) -> String {
+    if text.contains('\n') {
+        return text.to_string();
+    }
+
+    let sentences = split_dictation_sentences(text);
+    if sentences.len() < 2 {
+        return text.to_string();
+    }
+
+    let mut deduplicated = Vec::with_capacity(sentences.len());
+    let mut previous_key: Option<String> = None;
+    for sentence in sentences {
+        let key = normalized_sentence_key(&sentence);
+        if previous_key.as_deref() == Some(key.as_str()) {
+            continue;
+        }
+        previous_key = Some(key);
+        deduplicated.push(sentence);
+    }
+
+    let plain = deduplicated.join(" ");
+    let word_count = plain.split_whitespace().count();
+    if deduplicated.len() < 3 || word_count < 20 {
+        return plain;
+    }
+
+    let lowered = plain.to_lowercase();
+    let instruction_markers = [
+        "make sure",
+        "should",
+        "need to",
+        "i need",
+        "i want",
+        "please",
+        "fix",
+        "remove",
+        "add",
+        "change",
+        "keep",
+        "do not",
+        "don't",
+        "also",
+        "same for",
+        "error",
+        "issue",
+        "problem",
+    ];
+    let marker_count = instruction_markers
+        .iter()
+        .filter(|marker| lowered.contains(**marker))
+        .count();
+
+    if marker_count < 2 {
+        return plain;
+    }
+
+    deduplicated
+        .into_iter()
+        .map(|sentence| format!("- {sentence}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Context metadata associated with a voice request.
@@ -850,7 +952,7 @@ impl VoiceRouter {
 
         // Play specific song/artist - "play [song name]" or "play [artist]"
         // Opens Spotify, searches, and plays the first result
-        if t.starts_with("play ") && word_count >= 2 && word_count <= 6 {
+        if t.starts_with("play ") && (2..=6).contains(&word_count) {
             let song_query = t.replace("play ", "").trim().to_string();
             if !song_query.is_empty() && song_query != "music" {
                 return Some(ActionResult::action(
@@ -1140,6 +1242,25 @@ pub fn detect_local_command(text: &str) -> Option<ActionResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_instruction_dictation_is_deduplicated_and_structured() {
+        let input = "One issue is the error animation lasts too long. One issue is the error animation lasts too long. Please make sure it dismisses quickly. Also add a real error icon. The output should stay organized for long prompts.";
+        let processed = post_process_dictation(input);
+
+        assert_eq!(
+            processed,
+            "- One issue is the error animation lasts too long.\n- Please make sure it dismisses quickly.\n- Also add a real error icon.\n- The output should stay organized for long prompts."
+        );
+    }
+
+    #[test]
+    fn ordinary_short_dictation_stays_natural() {
+        assert_eq!(
+            post_process_dictation("hello there. how are you?"),
+            "Hello there. how are you?"
+        );
+    }
 
     #[test]
     fn detects_specific_song_play_requests() {

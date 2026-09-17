@@ -1,6 +1,7 @@
 //! Application configuration module
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Application configuration
@@ -19,6 +20,16 @@ pub struct AppConfig {
     /// Auto-copy transcription to clipboard
     pub auto_copy: bool,
 
+    /// Preferred microphone. `None` follows the current OS default device.
+    #[serde(default)]
+    pub selected_audio_device: Option<String>,
+
+    /// Prefer hardware acceleration for local transcription when available.
+    /// Older configs did not have this field, so migration keeps the product
+    /// GPU-first instead of silently pinning upgraded installs to CPU.
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
+
     /// UI preferences
     pub ui: UIConfig,
 
@@ -35,9 +46,91 @@ pub struct AppConfig {
     #[serde(default)]
     pub language_preferences: LanguagePreferences,
 
-    /// Vibe coding prompt enhancement settings
+    /// Vibe coding prompt formatting settings
     #[serde(default)]
     pub vibe_coding: VibeCodingConfig,
+}
+
+impl AppConfig {
+    fn storage_path() -> Result<PathBuf, String> {
+        let data_dir =
+            dirs_next::data_dir().ok_or_else(|| "Could not find data directory".to_string())?;
+        Ok(data_dir.join("ListenOS").join("config.json"))
+    }
+
+    /// Load the authoritative desktop configuration used by native frontends.
+    ///
+    /// Older ListenOS builds persisted only a few sub-settings. Callers may
+    /// still merge those legacy files after this returns so existing installs
+    /// retain their language and vibe preferences during the GPUI migration.
+    pub fn load_from_disk() -> Option<Self> {
+        let path = Self::storage_path().ok()?;
+        for candidate in [&path, &path.with_extension("json.bak")] {
+            let Ok(content) = std::fs::read_to_string(candidate) else {
+                continue;
+            };
+            match serde_json::from_str::<Self>(&content) {
+                Ok(config) => return Some(config),
+                Err(error) => {
+                    log::warn!(
+                        "Ignoring invalid ListenOS config at {}: {}",
+                        candidate.display(),
+                        error
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Persist the complete application configuration in the OS user-data
+    /// directory. The GPUI frontend calls the typed Rust config commands, so
+    /// settings no longer need browser localStorage to survive a restart.
+    pub fn save_to_disk(&self) -> Result<(), String> {
+        let path = Self::storage_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create config directory: {error}"))?;
+        }
+
+        let payload = serde_json::to_string_pretty(self)
+            .map_err(|error| format!("Failed to serialize application config: {error}"))?;
+        let temp_path = path.with_extension("json.tmp");
+        let backup_path = path.with_extension("json.bak");
+
+        // Keep one last-known-good copy so a power loss during replacement does
+        // not silently reset all native settings on the next launch.
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if serde_json::from_str::<Self>(&existing).is_ok() {
+                std::fs::write(&backup_path, existing)
+                    .map_err(|error| format!("Failed to back up application config: {error}"))?;
+            }
+        }
+
+        {
+            let mut file = std::fs::File::create(&temp_path)
+                .map_err(|error| format!("Failed to create temporary config: {error}"))?;
+            file.write_all(payload.as_bytes())
+                .map_err(|error| format!("Failed to write temporary config: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("Failed to flush temporary config: {error}"))?;
+        }
+
+        match std::fs::rename(&temp_path, &path) {
+            Ok(()) => Ok(()),
+            Err(rename_error) if path.exists() => {
+                // Windows does not replace an existing destination with
+                // `std::fs::rename`. The validated backup above provides a
+                // recovery source across the short remove/rename window.
+                std::fs::remove_file(&path)
+                    .map_err(|error| format!("Failed to replace application config: {error}"))?;
+                std::fs::rename(&temp_path, &path).map_err(|error| {
+                    format!("Failed to replace application config after {rename_error}: {error}")
+                })
+            }
+            Err(error) => Err(format!("Failed to replace application config: {error}")),
+        }
+    }
 }
 
 /// Multilingual language preferences.
@@ -96,54 +189,37 @@ impl Default for LanguagePreferences {
     }
 }
 
-/// Controls for enhancing spoken prompts before sending to AI coding tools.
+/// Controls for organizing spoken coding prompts before delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VibeCodingConfig {
     /// Master toggle.
     pub enabled: bool,
     /// Activation behavior.
     pub activation_mode: VibeActivationMode,
-    /// Spoken prefix that forces enhancement in manual mode.
+    /// Spoken prefix used when trigger-phrase activation is selected.
     pub trigger_phrase: String,
-    /// Preferred coding tool context.
-    pub target_tool: VibeTargetTool,
-    /// Prompt detail level.
-    pub detail_level: VibeDetailLevel,
-    /// Include explicit constraints section in enhanced prompt.
-    pub include_constraints: bool,
-    /// Include acceptance criteria section in enhanced prompt.
-    pub include_acceptance_criteria: bool,
-    /// Include test cases/checklist section in enhanced prompt.
-    pub include_test_notes: bool,
-    /// Preserve concise style for fast iteration.
-    pub concise_output: bool,
+    /// Presentation applied without changing the requested work.
+    pub formatting: VibeFormattingStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VibeActivationMode {
-    /// Enhance only when trigger phrase is spoken.
-    ManualOnly,
-    /// Enhance when trigger phrase is spoken or an AI coding app is active.
-    SmartAuto,
-    /// Always enhance typed dictation prompts.
-    Always,
+    /// Organize prompts when the active app or spoken request is clearly coding-related.
+    #[serde(alias = "SmartAuto", alias = "Always")]
+    Automatic,
+    /// Organize only when the configured trigger phrase is spoken.
+    #[serde(alias = "ManualOnly")]
+    TriggerPhrase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VibeTargetTool {
-    Generic,
-    Cursor,
-    Windsurf,
-    Claude,
-    ChatGPT,
-    Copilot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VibeDetailLevel {
-    Concise,
-    Balanced,
-    Detailed,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VibeFormattingStyle {
+    /// Keep the user's wording as natural prose.
+    #[default]
+    Natural,
+    /// Lay out the user's own clauses as a scan-friendly list.
+    Structured,
 }
 
 impl VibeCodingConfig {
@@ -178,14 +254,9 @@ impl Default for VibeCodingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            activation_mode: VibeActivationMode::SmartAuto,
+            activation_mode: VibeActivationMode::Automatic,
             trigger_phrase: "vibe".to_string(),
-            target_tool: VibeTargetTool::Generic,
-            detail_level: VibeDetailLevel::Balanced,
-            include_constraints: true,
-            include_acceptance_criteria: true,
-            include_test_notes: false,
-            concise_output: false,
+            formatting: VibeFormattingStyle::Natural,
         }
     }
 }
@@ -227,15 +298,24 @@ pub enum DictationStyle {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // Use Ctrl+Space on all platforms (Cmd+Space conflicts with Spotlight on macOS)
-        // Users can customize this in settings
-        let default_hotkey = "Ctrl+Space".to_string();
+        // Windows/Linux default to Win+Ctrl+Space: Win+Space alone flips
+        // keyboard layouts on Windows, so the extra Ctrl keeps the chord
+        // clear of the OS. macOS keeps Ctrl+Space because Ctrl+Cmd+Space
+        // is the system character viewer. Users can customize both bindings
+        // in settings; existing installs keep their saved shortcuts.
+        let default_hotkey = if cfg!(target_os = "macos") {
+            "Ctrl+Space".to_string()
+        } else {
+            "Meta+Ctrl+Space".to_string()
+        };
 
         Self {
             trigger_hotkey: default_hotkey,
             assistant_hotkey: default_assistant_hotkey(),
             listening_mode: ListeningMode::PushToTalk,
             auto_copy: true,
+            selected_audio_device: None,
+            use_gpu: default_use_gpu(),
             ui: UIConfig::default(),
             sound_feedback: true,
             auto_start: true,
@@ -261,6 +341,10 @@ fn default_assistant_hotkey() -> String {
     "Ctrl+Alt+Space".to_string()
 }
 
+fn default_use_gpu() -> bool {
+    true
+}
+
 /// UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UIConfig {
@@ -282,6 +366,10 @@ pub struct UIConfig {
     /// Window size
     pub window_width: u32,
     pub window_height: u32,
+
+    /// First-run native setup has completed.
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 impl Default for UIConfig {
@@ -294,6 +382,95 @@ impl Default for UIConfig {
             overlay_position: OverlayPosition::BottomCenter,
             window_width: 400,
             window_height: 600,
+            onboarding_completed: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_native_config_defaults_new_migration_fields() {
+        let mut value =
+            serde_json::to_value(AppConfig::default()).expect("serialize default config");
+        let object = value.as_object_mut().expect("config object");
+        object.remove("selected_audio_device");
+        object.remove("use_gpu");
+        object
+            .get_mut("ui")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("ui object")
+            .remove("onboarding_completed");
+
+        let config: AppConfig = serde_json::from_value(value).expect("load pre-native config");
+        assert_eq!(config.selected_audio_device, None);
+        assert!(config.use_gpu, "upgraded installs must remain GPU-first");
+        assert!(!config.ui.onboarding_completed);
+    }
+
+    #[test]
+    fn default_hold_to_talk_avoids_os_reserved_chords() {
+        // Win+Space flips keyboard layouts on Windows and Ctrl+Cmd+Space is
+        // the macOS character viewer, so each platform gets a clear default.
+        let expected = if cfg!(target_os = "macos") {
+            "Ctrl+Space"
+        } else {
+            "Meta+Ctrl+Space"
+        };
+        assert_eq!(AppConfig::default().trigger_hotkey, expected);
+    }
+
+    #[test]
+    fn legacy_vibe_config_migrates_to_simplified_contract() {
+        let legacy = serde_json::json!({
+            "enabled": true,
+            "activation_mode": "ManualOnly",
+            "trigger_phrase": "ship it",
+            "target_tool": "Cursor",
+            "detail_level": "Detailed",
+            "include_constraints": true,
+            "include_acceptance_criteria": true,
+            "include_test_notes": true,
+            "concise_output": false
+        });
+
+        let config: VibeCodingConfig =
+            serde_json::from_value(legacy).expect("load legacy vibe config");
+        assert!(config.enabled);
+        assert_eq!(config.activation_mode, VibeActivationMode::TriggerPhrase);
+        assert_eq!(config.trigger_phrase, "ship it");
+        assert_eq!(config.formatting, VibeFormattingStyle::Natural);
+
+        let serialized = serde_json::to_value(config).expect("serialize migrated vibe config");
+        let object = serialized.as_object().expect("vibe config object");
+        assert!(object.contains_key("formatting"));
+        for removed in [
+            "target_tool",
+            "detail_level",
+            "include_constraints",
+            "include_acceptance_criteria",
+            "include_test_notes",
+            "concise_output",
+        ] {
+            assert!(
+                !object.contains_key(removed),
+                "legacy field {removed} leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_automatic_modes_deserialize_as_coding_context_activation() {
+        for legacy_mode in ["SmartAuto", "Always"] {
+            let config: VibeCodingConfig = serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "activation_mode": legacy_mode,
+                "trigger_phrase": "vibe"
+            }))
+            .expect("load legacy automatic mode");
+            assert_eq!(config.activation_mode, VibeActivationMode::Automatic);
         }
     }
 }

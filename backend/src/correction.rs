@@ -137,7 +137,7 @@ fn is_likely_correction(original: &str, corrected: &str) -> bool {
 
     // It's a correction if:
     // - High similarity (60-95% matching) - not too similar (typo), not too different (different word)
-    match_ratio >= 0.5 && match_ratio < 1.0
+    (0.5..1.0).contains(&match_ratio)
 }
 
 fn levenshtein_distance(a: &str, b: &str) -> usize {

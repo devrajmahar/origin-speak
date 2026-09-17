@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -221,7 +222,7 @@ impl ConversationMemory {
         if self.extracted_facts.len() > MAX_FACTS_PER_SESSION {
             // Remove least used facts
             self.extracted_facts
-                .sort_by(|a, b| b.use_count.cmp(&a.use_count));
+                .sort_by_key(|fact| Reverse(fact.use_count));
             self.extracted_facts.truncate(MAX_FACTS_PER_SESSION);
         }
     }

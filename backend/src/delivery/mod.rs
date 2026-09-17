@@ -40,6 +40,16 @@ impl DeliveryStrategy {
     }
 }
 
+pub struct DeliveryUpdate {
+    pub phase: DeliveryPhase,
+    pub surface: TargetSurfaceKind,
+    pub target: Option<String>,
+    pub strategy: Option<DeliveryStrategy>,
+    pub attempts: u8,
+    pub summary: String,
+    pub recovered_to_clipboard: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryStatusSnapshot {
     pub phase: DeliveryPhase,
@@ -106,23 +116,14 @@ impl DeliveryState {
         };
     }
 
-    pub fn update(
-        &mut self,
-        phase: DeliveryPhase,
-        surface: TargetSurfaceKind,
-        target: Option<String>,
-        strategy: Option<DeliveryStrategy>,
-        attempts: u8,
-        summary: impl Into<String>,
-        recovered_to_clipboard: bool,
-    ) {
-        self.current.phase = phase;
-        self.current.surface = surface;
-        self.current.target = target;
-        self.current.strategy = strategy.map(|s| s.label().to_string());
-        self.current.attempts = attempts;
-        self.current.summary = summary.into();
-        self.current.recovered_to_clipboard = recovered_to_clipboard;
+    pub fn update(&mut self, update: DeliveryUpdate) {
+        self.current.phase = update.phase;
+        self.current.surface = update.surface;
+        self.current.target = update.target;
+        self.current.strategy = update.strategy.map(|s| s.label().to_string());
+        self.current.attempts = update.attempts;
+        self.current.summary = update.summary;
+        self.current.recovered_to_clipboard = update.recovered_to_clipboard;
         self.current.updated_at = Utc::now();
     }
 
@@ -151,7 +152,7 @@ impl Default for DeliveryState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SurfaceSnapshot {
     pub target_label: Option<String>,
     pub process_name: Option<String>,
@@ -162,22 +163,6 @@ pub struct SurfaceSnapshot {
     pub control_class_name: Option<String>,
     pub control_type: Option<i32>,
     pub text_snapshot: Option<String>,
-}
-
-impl Default for SurfaceSnapshot {
-    fn default() -> Self {
-        Self {
-            target_label: None,
-            process_name: None,
-            window_title: None,
-            window_class: None,
-            framework_id: None,
-            control_name: None,
-            control_class_name: None,
-            control_type: None,
-            text_snapshot: None,
-        }
-    }
 }
 
 impl SurfaceSnapshot {

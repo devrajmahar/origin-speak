@@ -1,56 +1,79 @@
 # ListenOS Setup
 
-ListenOS packages Electron, a React renderer built with Rspack, and a Rust native backend into one desktop app. No separate server or cloud login is required.
+ListenOS is a native GPUI desktop application linked directly to its Rust voice engine. No browser runtime, separate local server, or cloud login is required.
 
-## Install
+## Install prerequisites
 
-Install Node.js 20+, Rust stable, and the platform compiler toolchain, then run:
+Install Rust stable and the platform compiler toolchain.
+
+Windows requires Visual Studio Build Tools with C++. macOS requires Xcode Command Line Tools and macOS 13 or newer.
+
+## Run from source
 
 ```bash
-npm install
+cargo run --manifest-path native/Cargo.toml
 ```
 
-Windows requires Visual Studio Build Tools with C++. macOS requires Xcode Command Line Tools. Linux requires ALSA development headers.
+That plain build transcribes on CPU. For GPU-accelerated local Whisper, enable the platform backend (Windows requires the Vulkan SDK):
 
-## Configure
+```bash
+# Windows (requires the Vulkan SDK)
+cargo run --manifest-path native/Cargo.toml --features gpu-vulkan
+# macOS
+cargo run --manifest-path native/Cargo.toml --features gpu-metal
+```
 
-Dictation uses local Whisper inference and does not require a transcription API key. During first-run model setup, ListenOS downloads the default `base.en` model into the per-user models directory:
+Settings -> System reports the active backend and any CPU-fallback reason. On CPU-only builds, the `tiny.en` model has far lower latency than the default `base.en`.
+
+> Windows note: the Vulkan Whisper build nests CMake projects several levels deep, and MSVC refuses object paths over ~250 characters. If the Vulkan build fails with `error C1083: Cannot open compiler generated file: ''`, point Cargo at a short target directory before building:
+>
+> ```powershell
+> $env:CARGO_TARGET_DIR = "C:\ltarget"
+> cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-vulkan
+> ```
+
+Dictation uses local Whisper inference and does not require a transcription API key. During first-run setup, ListenOS downloads the selected model into the per-user models directory:
 
 ```text
 <user data directory>/ListenOS/models
 ```
 
-The exact user data root follows the operating system's standard application-data location. Model selection, download state, and runtime status are available in `Settings -> System`.
+Model selection, download state, microphone selection, shortcuts, language preferences, and other settings are available inside the native Settings view.
 
-If you want to change optional runtime behavior, copy `.env.example` to `.env.local`:
+## Optional runtime environment
 
-```env
-LISTENOS_REQUIRE_CONFIRMATION=false
+Sensitive command confirmations can be enabled for all confirmation-capable actions by setting this environment variable before launching ListenOS:
+
+```text
+LISTENOS_REQUIRE_CONFIRMATION=true
 ```
 
-After a model is downloaded, transcription runs locally on the machine. Network access is only needed when downloading a model.
+Power actions remain confirmation-gated even when that variable is not enabled.
 
-## Develop
+## Validate
 
 ```bash
-npm run desktop:dev
+cargo fmt --manifest-path backend/Cargo.toml -- --check
+cargo test --manifest-path backend/Cargo.toml --locked
+cargo fmt --manifest-path native/Cargo.toml -- --check
+cargo check --manifest-path native/Cargo.toml --locked
 ```
-
-This starts Rspack, Electron, and the Rust backend. Rust changes are rebuilt when the desktop app restarts.
 
 ## Package
 
+Build the release binary first:
+
 ```bash
-npm run desktop:build:windows
-npm run desktop:build:mac
-npm run desktop:build:linux
+cargo build --manifest-path native/Cargo.toml --release --locked
 ```
 
-Outputs are placed in `dist/electron/`.
+Windows packaging uses `native/packaging/windows/package.ps1` and NSIS. macOS packaging uses `native/packaging/macos/package.sh`. Tagged releases perform the required signing/notarization and publish native update metadata through the release workflow.
 
-## Default Shortcuts
+Native Linux packaging is currently unsupported because the passive overlay cannot yet guarantee click-through behavior across both Wayland and X11.
 
-- Hold-to-talk: `Ctrl+Space`
+## Default shortcuts
+
+- Hold-to-talk: `Meta+Ctrl+Space` (Win+Ctrl+Space) on Windows/Linux, `Ctrl+Space` on macOS
 - Assistant mode: `Ctrl+Alt+Space`
 
 Both are configurable in `Settings -> General`.

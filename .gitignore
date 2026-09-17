@@ -1,38 +1,9 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-
-# testing
-/coverage
-
-# renderer output
-/.npm-cache/
-/out/
-
-# server dependencies
-server/node_modules/
-
-# production
-/build
-
 # misc
 .DS_Store
 *.pem
 .vscode/
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
 
 # env files - keep all env files private
 .env
@@ -40,16 +11,12 @@ yarn-error.log*
 .env.local
 .env.development
 .env.production
-!.env.example
 
-# server env
-server/.env
-
-# vercel
-.vercel
-
-# typescript
-*.tsbuildinfo
-
-# Electron packaging output
+# Release packaging output
 /dist/
+
+# Native Rust desktop output
+/native/target/
+
+# Local validation/debug evidence
+/.cache/

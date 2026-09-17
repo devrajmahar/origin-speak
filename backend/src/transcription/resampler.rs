@@ -23,23 +23,25 @@ pub fn resample_buffer(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<
     let ratio = to_rate as f64 / from_rate as f64;
     let expected = (samples.len() as f64 * ratio).round() as usize;
     let delay = inner.output_delay();
-    let mut pending = samples.to_vec();
     let mut output = Vec::with_capacity(expected + delay);
+    let mut offset = 0usize;
 
-    while pending.len() >= CHUNK {
-        let chunk: Vec<f32> = pending.drain(..CHUNK).collect();
+    while offset + CHUNK <= samples.len() {
+        let chunk = samples[offset..offset + CHUNK].to_vec();
         let mut converted = inner
             .process(&[chunk], None)
             .map_err(|error| format!("resampler step failed: {error}"))?;
         if let Some(channel) = converted.pop() {
             output.extend(channel);
         }
+        offset += CHUNK;
     }
 
-    if !pending.is_empty() {
+    if offset < samples.len() {
+        let mut pending = samples[offset..].to_vec();
         pending.resize(CHUNK, 0.0);
         let mut converted = inner
-            .process(&[std::mem::take(&mut pending)], None)
+            .process(&[pending], None)
             .map_err(|error| format!("resampler flush failed: {error}"))?;
         if let Some(channel) = converted.pop() {
             output.extend(channel);

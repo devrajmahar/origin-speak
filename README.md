@@ -1,81 +1,81 @@
 # ListenOS
 
-AI-powered desktop voice control for Windows, macOS, and Linux.
+AI-powered native desktop voice control for Windows and macOS.
 
-ListenOS uses Electron for the desktop shell, a React interface bundled by Rspack, and a standalone Rust voice engine connected over private JSON-RPC IPC.
+ListenOS is a single-process Rust desktop application built with GPUI. The application owns its UI components on top of `gpui-base` and links the reusable Rust voice engine directly in-process through `voice_os_lib`.
 
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue) ![Electron](https://img.shields.io/badge/Electron-37-47848f) ![Rspack](https://img.shields.io/badge/Rspack-2-f4b942) ![Rust](https://img.shields.io/badge/Rust-stable-red)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-blue) ![GPUI](https://img.shields.io/badge/GPUI-native-3e63dd) ![Rust](https://img.shields.io/badge/Rust-stable-red)
 
 ## Features
 
-- Push-to-talk dictation and assistant mode with global shortcuts
-- Voice-to-action command execution
-- Local settings, conversations, clipboard history, dictionary, notes, and snippets
-- Configurable shortcuts, language preferences, microphone, and local Whisper model
-- Native tray, deep links, autostart, single-instance handling, and auto-updates
-- Sandboxed renderer with a narrow Electron preload API
+- Push-to-talk dictation and assistant mode with configurable global shortcuts
+- Local Whisper transcription and model management
+- Voice-to-action command execution with confirmation for sensitive actions
+- Conversation history, clipboard tools, dictionary, snippets, custom commands, integrations, and style controls
+- Native tray/menu-bar lifecycle, autostart, single-instance activation, and `listenos://` deep links
+- Native update checks with verified release manifests and package hashes
+- Local settings and persistence with no web runtime or separate backend process
 
-## Prerequisites
+## Supported desktop releases
 
-Windows:
+### Windows
 
 - Windows 10/11 (64-bit)
-- Node.js 20+
 - Rust stable
 - Visual Studio Build Tools with the C++ workload
+- NSIS only when building an installer locally
 
-macOS:
+### macOS
 
-- macOS 10.15+
-- Node.js 20+
+- macOS 13+
 - Rust stable
 - Xcode Command Line Tools
-- Microphone and Accessibility permissions
+- Microphone and Accessibility permissions for voice capture and automation
 
-Linux also needs the ALSA development package used by `cpal`.
+Native Linux packaging is intentionally not shipped yet. The current GPUI path cannot guarantee safe click-through behavior for passive overlay surfaces on both Wayland and X11. Linux release support requires a native package/desktop entry, protocol and autostart integration, and a safe cross-backend overlay/input implementation.
 
-## Quick Start
+## Quick start
 
 ```bash
-npm install
-npm run desktop:dev
+cargo run --manifest-path native/Cargo.toml
 ```
 
-Dictation runs locally with Whisper and does not require an API key. During first-run model setup, ListenOS downloads the default `base.en` model into the per-user ListenOS models directory:
+That plain build is CPU-only for transcription. For GPU-accelerated local Whisper, build with the platform backend (Windows needs the Vulkan SDK installed):
+
+```bash
+# Windows (requires the Vulkan SDK)
+cargo run --manifest-path native/Cargo.toml --features gpu-vulkan
+# macOS
+cargo run --manifest-path native/Cargo.toml --features gpu-metal
+```
+
+Settings -> System shows the active backend (`Active · Vulkan …` / `Active · Metal …` versus a CPU-fallback reason). If you are stuck on CPU, prefer the `tiny.en` model for much lower latency; `base.en` on CPU takes several seconds per utterance.
+
+Dictation runs locally with Whisper and does not require an API key. During first-run model setup, ListenOS downloads the selected model into the per-user ListenOS models directory:
 
 ```text
 <user data directory>/ListenOS/models
 ```
 
-You can choose or download another supported local model later from `Settings -> System`.
+Models and microphones can be changed later under `Settings -> System` and `Settings -> General`.
 
-Optional runtime configuration can still be placed in `.env.local`:
-
-```env
-LISTENOS_REQUIRE_CONFIRMATION=false
-```
-
-## Build
+## Build and validation
 
 ```bash
-npm run desktop:build
+cargo fmt --manifest-path backend/Cargo.toml -- --check
+cargo test --manifest-path backend/Cargo.toml --locked
+cargo fmt --manifest-path native/Cargo.toml -- --check
+cargo check --manifest-path native/Cargo.toml --locked
+cargo build --manifest-path native/Cargo.toml --release --locked
 ```
 
-Platform-specific bundles:
+Native release packaging lives under `native/packaging/`. Windows uses a per-user NSIS installer. macOS produces a signed application bundle, DMG, and ZIP; tagged releases require production signing credentials and notarization.
 
-```bash
-npm run desktop:build:windows
-npm run desktop:build:mac
-npm run desktop:build:linux
-```
-
-Installers and update metadata are written to `dist/electron/`.
-
-## Default Shortcuts
+## Default shortcuts
 
 | Action | Default | Behavior |
 |---|---|---|
-| Hold-to-talk | `Ctrl+Space` | Hold to record, release to process |
+| Hold-to-talk | `Meta+Ctrl+Space` on Windows/Linux, `Ctrl+Space` on macOS | Hold to record, release to process |
 | Assistant mode | `Ctrl+Alt+Space` | Toggle hands-free listening |
 
 Both shortcuts are configurable under `Settings -> General`.
@@ -83,54 +83,60 @@ Both shortcuts are configurable under `Settings -> General`.
 ## Architecture
 
 ```text
-ListenOS/
-|-- electron/
-|   |-- main.cjs          # Windows, tray, lifecycle, updates, backend process
-|   `-- preload.cjs       # Sandboxed renderer API
-|-- src/
-|   |-- app/              # Dashboard and assistant screen modules
-|   |-- components/
-|   `-- lib/desktop.ts    # Typed command and event bridge
-|-- backend/
-|   `-- src/
-|       |-- ipc.rs        # Line-delimited JSON-RPC server
-|       |-- commands/     # Voice and automation command handlers
-|       |-- audio/
-|       |-- transcription/ # Local Whisper model management and inference
-|       `-- streaming/
-`-- scripts/
-    `-- electron-dev.mjs  # Rspack + Electron development launcher
+global shortcuts / native windows / tray / updater
+                         |
+                         v
+                     GPUI app
+                         |
+                         v
+                  voice_os_lib
+              /       |       \
+           audio   whisper   state/delivery
 ```
 
-Electron owns desktop lifecycle concerns. The Rust child process owns audio capture, local transcription, persistence, global hotkeys, and native system automation. Renderer code cannot access Node.js or spawn arbitrary processes directly.
+Repository layout:
 
-## Scripts
+```text
+ListenOS/
+|-- native/                  # GPUI desktop application and platform shell
+|   |-- src/                 # Native windows, state, runtime bridge, views
+|   `-- packaging/           # Windows/macOS packaging and update metadata helpers
+|-- backend/                 # Reusable Rust application/voice core (rlib)
+|   `-- src/
+|       |-- commands/        # Typed application operations
+|       |-- shortcuts.rs     # Transport-independent global shortcuts
+|       |-- audio/
+|       `-- transcription/   # Local Whisper model management and inference
+|-- scripts/                 # Small release-version helpers
+`-- docs/
+```
 
-| Command | Description |
-|---|---|
-| `npm run dev` | Start only the Rspack development server |
-| `npm run desktop:dev` | Start the complete Electron app |
-| `npm run build` | Bundle the React renderer with Rspack |
-| `npm run backend:build` | Compile the Rust backend in release mode |
-| `npm run desktop:build` | Build the current platform package |
-| `npm run lint` | Run ESLint |
+The desktop runtime is one Rust process. GPUI calls typed core APIs directly. CPU-heavy transcription, downloads, persistence, update I/O, and other blocking work run away from the GPUI render thread.
+
+The UI layering is application-owned:
+
+```text
+ListenOS UI / components
+          |
+          v
+      gpui-base
+          |
+          v
+         GPUI
+```
+
+See [`docs/gpui-native-architecture.md`](docs/gpui-native-architecture.md) for architecture and release-readiness requirements.
 
 ## Releases
 
-Tagged releases build Electron installers on Windows, macOS, and Linux. Electron Builder produces the `latest*.yml` metadata consumed by `electron-updater`, and the release workflow publishes it to Cloudflare R2.
+Tagged releases use `.github/workflows/release.yml` to build the native Windows and macOS applications. Windows release artifacts are code-signed and timestamped. macOS release artifacts require Developer ID signing and notarization. The workflow publishes release packages and `native-update.json` to Cloudflare R2 for the native updater.
 
-Required GitHub secrets:
+Version changes use one Python standard-library helper:
 
-- `CLOUDFLARE_R2_ACCESS_KEY_ID`
-- `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
-- `CLOUDFLARE_R2_ENDPOINT`
-- `CLOUDFLARE_R2_BUCKET`
-- `CLOUDFLARE_R2_PUBLIC_BASE_URL`
-
-Version helpers:
-
-- `npm run release:prepare -- <version>`
-- `npm run version:sync`
+```bash
+python scripts/version.py bump 0.1.22
+python scripts/version.py sync
+```
 
 ## License
 
