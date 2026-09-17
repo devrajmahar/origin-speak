@@ -3,10 +3,8 @@
 //! Electron owns windows, tray, deep links, autostart, and updates. This crate
 //! stays focused on audio, AI processing, persistence, and system automation.
 
-mod ai;
 mod audio;
 mod clipboard;
-mod cloud;
 mod commands;
 mod config;
 mod conversation;
@@ -20,13 +18,14 @@ mod notes;
 mod snippets;
 mod streaming;
 mod system;
+mod transcription;
+mod voice;
 
 use std::{ops::Deref, sync::Arc};
 use tokio::sync::Mutex;
 
 pub use audio::AudioState;
 pub use clipboard::ClipboardService;
-pub use cloud::{VoiceContext, VoiceMode};
 pub use commands::*;
 pub use config::AppConfig;
 pub use conversation::{ConversationMemory, ConversationStore, Fact, Message, Role};
@@ -37,9 +36,12 @@ pub use error_log::{ErrorEntry, ErrorLog, ErrorType};
 pub use integrations::{AppIntegration, IntegrationManager};
 pub use notes::{Note, NotesStore};
 pub use snippets::{Snippet, SnippetsStore};
-pub use streaming::{
-    AudioAccumulator, AudioHealthPhase, AudioRuntimeStatus, AudioStreamer, SAMPLE_RATE,
+pub use streaming::{AudioHealthPhase, AudioRuntimeStatus, AudioStreamer, SAMPLE_RATE};
+pub use transcription::{
+    LocalModelInfo, TranscriptionRuntimePhase, TranscriptionRuntimeStatus, TranscriptionService,
+    TranscriptionSettings,
 };
+pub use voice::{VoiceContext, VoiceMode};
 
 /// Borrowed state wrapper used by native command handlers.
 #[derive(Clone, Copy)]
@@ -64,7 +66,7 @@ pub struct AppState {
     pub audio: Arc<Mutex<AudioState>>,
     pub config: Arc<Mutex<AppConfig>>,
     pub streamer: Arc<Mutex<AudioStreamer>>,
-    pub accumulator: Arc<Mutex<AudioAccumulator>>,
+    pub transcription: Arc<TranscriptionService>,
     pub is_listening: Arc<Mutex<bool>>,
     pub is_processing: Arc<Mutex<bool>>,
     pub current_context: Arc<Mutex<VoiceContext>>,
@@ -101,7 +103,7 @@ impl Default for AppState {
             audio: Arc::new(Mutex::new(AudioState::default())),
             config: Arc::new(Mutex::new(app_config)),
             streamer: Arc::new(Mutex::new(AudioStreamer::new())),
-            accumulator: Arc::new(Mutex::new(AudioAccumulator::new(SAMPLE_RATE))),
+            transcription: Arc::new(TranscriptionService::new()),
             is_listening: Arc::new(Mutex::new(false)),
             is_processing: Arc::new(Mutex::new(false)),
             current_context: Arc::new(Mutex::new(VoiceContext::default())),

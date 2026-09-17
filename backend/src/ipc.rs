@@ -169,6 +169,34 @@ pub async fn run() {
             }
         };
 
+        // Model downloads may take minutes. Run them independently so the stdin
+        // loop can continue servicing capture stop/cancel, status, and settings
+        // requests while bytes are streaming to disk.
+        if request.command == "download_local_model" {
+            let model = match required::<String>(&request.args, &["model"]) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = outbound.send(json!({ "id": request.id, "error": error }));
+                    continue;
+                }
+            };
+            let transcription = state.transcription.clone();
+            let response_outbound = outbound.clone();
+            tokio::spawn(async move {
+                let result = transcription.download_model(&model).await.and_then(value);
+                match result {
+                    Ok(result) => {
+                        let _ =
+                            response_outbound.send(json!({ "id": request.id, "result": result }));
+                    }
+                    Err(error) => {
+                        let _ = response_outbound.send(json!({ "id": request.id, "error": error }));
+                    }
+                }
+            });
+            continue;
+        }
+
         let updates_hotkeys = matches!(
             request.command.as_str(),
             "set_config" | "set_trigger_hotkey" | "set_assistant_hotkey"
@@ -242,6 +270,7 @@ async fn dispatch(state: &AppState, command: &str, args: &Value) -> Result<Value
     let state = State::new(state);
     match command {
         "start_listening" => value(commands::start_listening(state).await?),
+        "cancel_listening" => value(commands::cancel_listening(state).await?),
         "stop_listening" => value(
             commands::stop_listening(state, optional(args, &["dictationOnly", "dictation_only"])?)
                 .await?,
@@ -256,6 +285,17 @@ async fn dispatch(state: &AppState, command: &str, args: &Value) -> Result<Value
             commands::set_audio_device(state, required(args, &["deviceName", "device_name"])?)
                 .await?,
         ),
+        "list_local_models" => value(commands::list_local_models(state).await?),
+        "get_transcription_settings" => value(commands::get_transcription_settings(state).await?),
+        "set_transcription_model" => {
+            value(commands::set_transcription_model(state, required(args, &["model"])?).await?)
+        }
+        "get_transcription_runtime_status" => {
+            value(commands::get_transcription_runtime_status(state).await?)
+        }
+        "download_local_model" => {
+            value(commands::download_local_model(state, required(args, &["model"])?).await?)
+        }
         "type_text" => value(commands::type_text(state, required(args, &["text"])?).await?),
         "run_system_command" => {
             value(commands::run_system_command(required(args, &["command"])?).await?)
@@ -300,11 +340,6 @@ async fn dispatch(state: &AppState, command: &str, args: &Value) -> Result<Value
         "set_vibe_coding_config" => {
             value(commands::set_vibe_coding_config(state, required(args, &["config"])?).await?)
         }
-        "get_local_api_settings" => value(commands::get_local_api_settings().await?),
-        "set_local_api_settings" => value(
-            commands::set_local_api_settings(required(args, &["groqApiKey", "groq_api_key"])?)
-                .await?,
-        ),
         "get_custom_commands" => value(commands::get_custom_commands().await?),
         "get_command_templates" => value(commands::get_command_templates().await?),
         "save_custom_command" => {
@@ -397,22 +432,47 @@ async fn dispatch(state: &AppState, command: &str, args: &Value) -> Result<Value
 }
 
 async fn create_voice_note(state: State<'_, AppState>) -> Result<crate::Note, String> {
-    use crate::cloud::VoiceClient;
-
     let (samples, sample_rate) = {
-        let accumulator = state.accumulator.lock().await;
+        let streamer = state.streamer.lock().await;
         (
-            accumulator.get_samples().to_vec(),
-            accumulator.sample_rate(),
+            streamer.get_accumulated_samples(),
+            streamer.current_sample_rate(),
         )
     };
-    if samples.len() < 1600 {
+    let minimum_samples = (sample_rate as usize / 10).max(1);
+    if samples.len() < minimum_samples {
         return Err("Recording too short".to_string());
     }
 
-    let wav_data = crate::cloud::encode_wav(&samples, sample_rate)?;
-    let result = VoiceClient::new().transcribe(&wav_data).await?;
-    let text = result.text.trim();
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    let active_ratio =
+        samples.iter().filter(|sample| sample.abs() > 0.012).count() as f32 / samples.len() as f32;
+    if rms < 0.0028 && peak < 0.02 && active_ratio < 0.01 {
+        return Err("No speech detected".to_string());
+    }
+
+    let (language, dictionary_hints) = {
+        let config = state.config.lock().await;
+        let language = config
+            .language_preferences
+            .transcription_language_hint()
+            .map(str::to_string);
+        let dictionary_hints = crate::DictionaryStore::new()
+            .and_then(|store| store.get_words_for_recognition())
+            .unwrap_or_default();
+        (language, dictionary_hints)
+    };
+
+    let result = state
+        .transcription
+        .transcribe(samples, sample_rate, language, dictionary_hints)
+        .await?;
+    let text = result.trim();
     if text.is_empty() {
         return Err("No speech detected".to_string());
     }

@@ -1,6 +1,5 @@
 //! Application configuration module
 
-use crate::ai::{AIProvider, LLMConfig, WhisperConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,18 +18,6 @@ pub struct AppConfig {
 
     /// Auto-copy transcription to clipboard
     pub auto_copy: bool,
-
-    /// Whisper/STT configuration
-    pub whisper: WhisperConfig,
-
-    /// LLM configuration
-    pub llm: LLMConfig,
-
-    /// AI provider to use
-    pub ai_provider: AIProvider,
-
-    /// API keys for external providers
-    pub api_keys: ApiKeys,
 
     /// UI preferences
     pub ui: UIConfig,
@@ -249,10 +236,6 @@ impl Default for AppConfig {
             assistant_hotkey: default_assistant_hotkey(),
             listening_mode: ListeningMode::PushToTalk,
             auto_copy: true,
-            whisper: WhisperConfig::default(),
-            llm: LLMConfig::default(),
-            ai_provider: AIProvider::Local,
-            api_keys: ApiKeys::default(),
             ui: UIConfig::default(),
             sound_feedback: true,
             auto_start: true,
@@ -272,57 +255,6 @@ pub enum ListeningMode {
     Toggle,
     /// Continuous listening with wake word
     VoiceActivated,
-}
-
-/// API keys for external services
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ApiKeys {
-    pub openai: Option<String>,
-    pub openrouter: Option<String>,
-    pub anthropic: Option<String>,
-}
-
-/// Local runtime API settings persisted on device.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LocalApiSettings {
-    pub groq_api_key: String,
-}
-
-impl LocalApiSettings {
-    fn storage_path() -> Result<PathBuf, String> {
-        let data_dir =
-            dirs_next::data_dir().ok_or_else(|| "Could not find data directory".to_string())?;
-        Ok(data_dir.join("ListenOS").join("local_api_settings.json"))
-    }
-
-    pub fn load_from_disk() -> Option<Self> {
-        let path = Self::storage_path().ok()?;
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str::<Self>(&content).ok()
-    }
-
-    pub fn save_to_disk(&self) -> Result<(), String> {
-        let path = Self::storage_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create API settings directory: {}", e))?;
-        }
-
-        let payload = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize local API settings: {}", e))?;
-        std::fs::write(&path, payload)
-            .map_err(|e| format!("Failed to write local API settings: {}", e))?;
-        Ok(())
-    }
-}
-
-impl Default for LocalApiSettings {
-    fn default() -> Self {
-        Self {
-            groq_api_key: std::env::var("GROQ_API_KEY").unwrap_or_default(),
-        }
-    }
 }
 
 fn default_assistant_hotkey() -> String {

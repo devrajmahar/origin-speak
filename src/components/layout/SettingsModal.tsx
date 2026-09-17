@@ -14,10 +14,13 @@ import {
   setLanguagePreferences,
   getVibeCodingConfig,
   setVibeCodingConfig,
-  getLocalApiSettings,
-  setLocalApiSettings,
+  listLocalModels,
+  getTranscriptionSettings,
+  setTranscriptionModel,
+  getTranscriptionRuntimeStatus,
+  downloadLocalModel,
 } from "@/lib/desktop";
-import type { VibeCodingConfig } from "@/lib/desktop";
+import type { LocalModelInfo, TranscriptionRuntimeStatus, VibeCodingConfig } from "@/lib/desktop";
 import { checkForUpdates } from "@/lib/updater";
 import { useSettings } from "@/context/SettingsContext";
 import packageInfo from "../../../package.json";
@@ -137,6 +140,24 @@ const DEFAULT_VIBE_CONFIG: VibeCodingConfig = {
   include_test_notes: false,
   concise_output: false,
 };
+
+function modelLabel(model: LocalModelInfo): string {
+  return model.label || model.id;
+}
+
+function selectedTranscriptionModel(settings: { model: string } | null): string {
+  return settings?.model || "";
+}
+
+function englishOnlyModelWarning(model: string, language: string): string | null {
+  const normalizedLanguage = language.trim().toLowerCase();
+  if (!model.endsWith(".en") || !normalizedLanguage || normalizedLanguage === "auto" || normalizedLanguage.startsWith("en")) {
+    return null;
+  }
+
+  const multilingualModel = model.replace(/\.en$/, "");
+  return `${model} is English-only. Select the multilingual ${multilingualModel} model in System before dictating in ${getLanguageLabel(language, true)}.`;
+}
 
 function getLanguageLabel(code: string, source = false): string {
   const options = source ? SOURCE_LANGUAGE_OPTIONS : TARGET_LANGUAGE_OPTIONS;
@@ -274,9 +295,13 @@ function SettingsContent({ section }: { section: SettingsSection }) {
   const [vibeConfig, setVibeConfigState] = useState<VibeCodingConfig>(DEFAULT_VIBE_CONFIG);
   const [vibeSaving, setVibeSaving] = useState(false);
   const [vibeLoading, setVibeLoading] = useState(false);
-  const [groqApiKey, setGroqApiKey] = useState("");
-  const [apiSettingsLoading, setApiSettingsLoading] = useState(false);
-  const [apiSettingsSaving, setApiSettingsSaving] = useState(false);
+  const [localModels, setLocalModels] = useState<LocalModelInfo[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [transcriptionStatus, setTranscriptionStatus] = useState<TranscriptionRuntimeStatus | null>(null);
+  const [modelSettingsLoading, setModelSettingsLoading] = useState(false);
+  const [modelSettingsSaving, setModelSettingsSaving] = useState(false);
+  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [modelNotice, setModelNotice] = useState<string | null>(null);
 
   // Load actual autostart state on mount
   useEffect(() => {
@@ -309,16 +334,22 @@ function SettingsContent({ section }: { section: SettingsSection }) {
         })
         .finally(() => setVibeLoading(false));
 
-      setApiSettingsLoading(true);
-      getLocalApiSettings()
-        .then((localApi) => {
-          setGroqApiKey(localApi.groq_api_key ?? "");
+      setModelSettingsLoading(true);
+      Promise.all([
+        listLocalModels(),
+        getTranscriptionSettings(),
+        getTranscriptionRuntimeStatus(),
+      ])
+        .then(([models, transcriptionSettings, runtimeStatus]) => {
+          setLocalModels(models);
+          setSelectedModel(selectedTranscriptionModel(transcriptionSettings));
+          setTranscriptionStatus(runtimeStatus);
         })
         .catch((err) => {
-          console.error("Failed to load local API settings:", err);
-          setUpdateStatus("Failed to load local API settings");
+          console.error("Failed to load local transcription settings:", err);
+          setModelNotice(err instanceof Error ? err.message : "Failed to load local transcription settings");
         })
-        .finally(() => setApiSettingsLoading(false));
+        .finally(() => setModelSettingsLoading(false));
     }
   }, []);
 
@@ -382,23 +413,69 @@ function SettingsContent({ section }: { section: SettingsSection }) {
     await updateSettings({ showInTray: checked });
   }, [updateSettings]);
 
-  const handleGroqApiKeySave = useCallback(async () => {
-    if (!isElectron()) {
+  const refreshTranscriptionStatus = useCallback(async () => {
+    if (!isElectron()) return;
+    const [models, runtimeStatus] = await Promise.all([
+      listLocalModels(),
+      getTranscriptionRuntimeStatus(),
+    ]);
+    setLocalModels(models);
+    setTranscriptionStatus(runtimeStatus);
+  }, []);
+
+  const handleTranscriptionModelChange = useCallback(async (model: string) => {
+    if (!isElectron()) return;
+    const previous = selectedModel;
+    setSelectedModel(model);
+    const target = localModels.find((candidate) => candidate.id === model);
+    if (target && !target.downloaded) {
+      setModelNotice(`${target.label} must be downloaded before it becomes the active model.`);
       return;
     }
 
-    setApiSettingsSaving(true);
+    setModelSettingsSaving(true);
+    setModelNotice(null);
     try {
-      const saved = await setLocalApiSettings(groqApiKey);
-      setGroqApiKey(saved.groq_api_key ?? "");
-      setUpdateStatus("Groq API key saved locally");
+      const saved = await setTranscriptionModel(model);
+      setSelectedModel(selectedTranscriptionModel(saved) || model);
+      await refreshTranscriptionStatus();
+      setModelNotice("Local transcription model updated");
     } catch (err) {
-      console.error("Failed to save Groq API key:", err);
-      setUpdateStatus("Failed to save Groq API key");
+      console.error("Failed to update transcription model:", err);
+      setSelectedModel(previous);
+      setModelNotice(err instanceof Error ? err.message : "Failed to update transcription model");
     } finally {
-      setApiSettingsSaving(false);
+      setModelSettingsSaving(false);
     }
-  }, [groqApiKey]);
+  }, [localModels, refreshTranscriptionStatus, selectedModel]);
+
+  const handleModelDownload = useCallback(async (model: string) => {
+    if (!isElectron()) return;
+    setDownloadingModel(model);
+    setModelNotice(`Downloading ${model}...`);
+    try {
+      await downloadLocalModel(model);
+    } catch (err) {
+      console.error("Failed to download local model:", err);
+      setModelNotice(err instanceof Error ? err.message : "Failed to download local model");
+      setDownloadingModel(null);
+      return;
+    }
+
+    try {
+      const saved = await setTranscriptionModel(model);
+      setSelectedModel(selectedTranscriptionModel(saved) || model);
+      await refreshTranscriptionStatus();
+      setModelNotice(`${model} is ready to use`);
+    } catch (err) {
+      console.error("Model downloaded but could not be activated:", err);
+      await refreshTranscriptionStatus().catch(() => undefined);
+      setModelNotice(err instanceof Error
+        ? `Model downloaded, but activation failed: ${err.message}`
+        : "Model downloaded, but activation failed. Select it again to retry.");
+    }
+    setDownloadingModel(null);
+  }, [refreshTranscriptionStatus]);
 
   const handleSourceLanguageChange = useCallback(async (newLanguage: string) => {
     const previousSource = sourceLanguage;
@@ -549,7 +626,8 @@ function SettingsContent({ section }: { section: SettingsSection }) {
   }, [applyShortcut]);
 
   switch (section) {
-    case "general":
+    case "general": {
+      const sourceModelWarning = englishOnlyModelWarning(selectedModel, sourceLanguage);
       return (
         <div className="animate-fade-in">
           <h2 className="mb-6 text-2xl font-normal text-foreground">General</h2>
@@ -607,7 +685,7 @@ function SettingsContent({ section }: { section: SettingsSection }) {
             />
             <SettingsRow
               label="Source language"
-              description={getLanguageLabel(sourceLanguage, true)}
+              description={sourceModelWarning || getLanguageLabel(sourceLanguage, true)}
               action={
                 <SettingsSelect
                   value={sourceLanguage}
@@ -652,7 +730,22 @@ function SettingsContent({ section }: { section: SettingsSection }) {
           </div>
         </div>
       );
-    case "system":
+    }
+    case "system": {
+      const selectedModelInfo = localModels.find((model) => model.id === selectedModel);
+      const modelDescription = selectedModelInfo
+        ? `${selectedModelInfo.filename} · ${selectedModelInfo.downloaded ? "Downloaded" : "Download required"}`
+        : modelSettingsLoading
+          ? "Loading local models..."
+          : "Choose the local speech model used for dictation.";
+      const runtimeDescription = transcriptionStatus
+        ? modelNotice || transcriptionStatus.last_error || (transcriptionStatus.phase === "Ready"
+          ? `Ready · ${transcriptionStatus.model}`
+          : transcriptionStatus.phase === "ModelMissing"
+            ? `Model ${transcriptionStatus.model} needs to be downloaded.`
+            : transcriptionStatus.phase)
+        : modelNotice || "Runtime status is not available yet.";
+
       return (
         <div className="animate-fade-in">
           <h2 className="mb-6 text-2xl font-normal text-foreground">System</h2>
@@ -679,31 +772,59 @@ function SettingsContent({ section }: { section: SettingsSection }) {
               }
             />
             <SettingsRow
-              label="Groq API key"
-              description={groqApiKey.trim().length > 0 ? "Your key is saved on this device." : "Required for Groq Whisper transcription."}
+              label="Transcription model"
+              description={modelDescription}
               action={
                 <div className="flex items-center gap-2">
-                  <input
-                    type="password"
-                    value={groqApiKey}
-                    onChange={(e) => setGroqApiKey(e.target.value)}
-                    disabled={apiSettingsLoading || apiSettingsSaving}
-                    placeholder="gsk_..."
-                    className="ui-input w-56 rounded-df border border-muted-border bg-input px-3 py-2 text-sm font-normal text-foreground transition-colors"
-                  />
-                  <button
-                    onClick={() => void handleGroqApiKeySave()}
-                    disabled={apiSettingsLoading || apiSettingsSaving}
-                    className="ui-button ui-button-outline rounded-df border border-muted-border bg-muted px-4 py-2 text-sm font-normal text-foreground transition-colors hover:bg-accent"
-                  >
-                    {apiSettingsSaving ? "Saving..." : "Save"}
-                  </button>
+                  {localModels.length > 0 ? (
+                    <SettingsSelect
+                      value={selectedModel || localModels[0].id}
+                      onValueChange={(value) => void handleTranscriptionModelChange(value)}
+                      disabled={modelSettingsLoading || modelSettingsSaving || downloadingModel !== null}
+                      options={localModels.map((model) => ({
+                        value: model.id,
+                        label: `${modelLabel(model)}${model.downloaded ? "" : " · download"}`,
+                      }))}
+                      className="min-w-[210px]"
+                    />
+                  ) : (
+                    <span className="text-sm text-muted-foreground">
+                      {modelSettingsLoading ? "Loading..." : "No models available"}
+                    </span>
+                  )}
+                  {selectedModelInfo && !selectedModelInfo.downloaded && (
+                    <button
+                      onClick={() => void handleModelDownload(selectedModelInfo.id)}
+                      disabled={downloadingModel !== null || modelSettingsSaving}
+                      className="ui-button ui-button-outline flex items-center gap-2 rounded-df border border-muted-border bg-muted px-4 py-2 text-sm font-normal text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+                    >
+                      <HugeiconsIcon
+                        icon={downloadingModel === selectedModelInfo.id ? Loading03Icon : Download04Icon}
+                        size={16}
+                        className={downloadingModel === selectedModelInfo.id ? "animate-spin" : ""}
+                      />
+                      {downloadingModel === selectedModelInfo.id ? "Downloading..." : "Download"}
+                    </button>
+                  )}
                 </div>
+              }
+            />
+            <SettingsRow
+              label="Local transcription runtime"
+              description={runtimeDescription}
+              action={
+                <span className={cn(
+                  "text-sm",
+                  transcriptionStatus?.phase === "Ready" ? "text-positive" : "text-muted-foreground"
+                )}>
+                  {transcriptionStatus?.phase || "Checking"}
+                </span>
               }
             />
           </div>
         </div>
       );
+    }
     case "vibe-coding":
       return (
         <div className="animate-fade-in">
@@ -887,9 +1008,7 @@ function SettingsContent({ section }: { section: SettingsSection }) {
           <h2 className="mb-6 text-2xl font-normal text-foreground">Plans and Billing</h2>
           <div className="rounded-df border border-muted-border bg-muted p-4">
             <p className="text-sm text-muted-foreground">
-              ListenOS self-hosted mode has no account billing. Use your own API keys in
-              <span className="font-normal text-foreground"> System </span>
-              settings.
+              ListenOS local mode has no account billing. Speech models are stored and run on this device.
             </p>
           </div>
         </div>

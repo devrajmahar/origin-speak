@@ -202,10 +202,7 @@ impl AudioStreamer {
     }
 
     /// Start recording audio directly to internal buffer
-    pub fn start_streaming(
-        &self,
-        preferred_device_name: Option<&str>,
-    ) -> Result<crossbeam_channel::Receiver<Vec<f32>>, String> {
+    pub fn start_streaming(&self, preferred_device_name: Option<&str>) -> Result<(), String> {
         if self.is_recording.load(Ordering::SeqCst) {
             return Err("Already recording".to_string());
         }
@@ -217,8 +214,6 @@ impl AudioStreamer {
         self.live_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.update_runtime(AudioHealthPhase::Starting, None, None, false);
-
-        let (sender, receiver) = crossbeam_channel::unbounded::<Vec<f32>>();
 
         let is_recording = self.is_recording.clone();
         let accumulated = self.accumulated_samples.clone();
@@ -263,7 +258,6 @@ impl AudioStreamer {
 
         let is_rec = is_recording.clone();
         let acc = accumulated.clone();
-        let sender_clone = sender;
         let config: cpal::StreamConfig = supported_config.clone().into();
 
         let build_stream =
@@ -278,7 +272,6 @@ impl AudioStreamer {
                             acc.clone(),
                             live_level.clone(),
                             runtime.clone(),
-                            sender_clone.clone(),
                         );
                     },
                     move |err| {
@@ -303,7 +296,6 @@ impl AudioStreamer {
                             acc.clone(),
                             live_level.clone(),
                             runtime.clone(),
-                            sender_clone.clone(),
                         );
                     },
                     move |err| {
@@ -330,7 +322,6 @@ impl AudioStreamer {
                             acc.clone(),
                             live_level.clone(),
                             runtime.clone(),
-                            sender_clone.clone(),
                         );
                     },
                     move |err| {
@@ -379,7 +370,7 @@ impl AudioStreamer {
 
         log::info!("Audio streaming started at {} Hz", config.sample_rate.0);
 
-        Ok(receiver)
+        Ok(())
     }
 
     /// Stop streaming
@@ -533,7 +524,6 @@ fn process_input_data(
     accumulated: Arc<Mutex<Vec<f32>>>,
     live_level: Arc<AtomicU32>,
     runtime: Arc<Mutex<RuntimeMetrics>>,
-    sender: crossbeam_channel::Sender<Vec<f32>>,
 ) {
     if !is_recording.load(Ordering::SeqCst) {
         live_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
@@ -579,8 +569,6 @@ fn process_input_data(
     if let Ok(mut samples) = accumulated.try_lock() {
         samples.extend_from_slice(&mono);
     }
-
-    let _ = sender.try_send(mono);
 }
 
 fn now_millis() -> u64 {
@@ -588,70 +576,4 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-/// Accumulator that collects audio until recording stops
-pub struct AudioAccumulator {
-    samples: Vec<f32>,
-    sample_rate: u32,
-}
-
-impl AudioAccumulator {
-    pub fn new(sample_rate: u32) -> Self {
-        Self {
-            samples: Vec::with_capacity(sample_rate as usize * 30), // 30 seconds max
-            sample_rate,
-        }
-    }
-
-    /// Add samples to the accumulator
-    pub fn add_samples(&mut self, samples: &[f32]) {
-        self.samples.extend_from_slice(samples);
-    }
-
-    /// Get all accumulated samples
-    pub fn get_samples(&self) -> &[f32] {
-        &self.samples
-    }
-
-    /// Clear the accumulator
-    pub fn clear(&mut self) {
-        self.samples.clear();
-    }
-
-    pub fn set_sample_rate(&mut self, sample_rate: u32) {
-        self.sample_rate = sample_rate.max(1);
-    }
-
-    /// Get sample rate
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-}
-
-pub fn spawn_audio_receiver_task(
-    receiver: crossbeam_channel::Receiver<Vec<f32>>,
-    accumulator: Arc<tokio::sync::Mutex<AudioAccumulator>>,
-    is_listening: Arc<tokio::sync::Mutex<bool>>,
-) {
-    tokio::spawn(async move {
-        loop {
-            if !*is_listening.lock().await {
-                break;
-            }
-
-            match receiver.try_recv() {
-                Ok(chunk) => {
-                    let mut acc = accumulator.lock().await;
-                    acc.add_samples(&chunk);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-    });
 }

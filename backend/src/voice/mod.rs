@@ -1,44 +1,9 @@
-//! Cloud API providers for Listen OS
+//! Local voice intent routing for ListenOS.
+//!
+//! Speech-to-text is owned by `crate::transcription`; this module only turns
+//! already-transcribed text into deterministic local actions.
 
-use reqwest::multipart::{Form, Part};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-
-// ============ API KEY HELPERS ============
-// For local/fallback mode only - reads from environment
-
-/// Get the Groq API key from environment or local settings.
-pub fn get_groq_key() -> String {
-    if let Ok(value) = std::env::var("GROQ_API_KEY") {
-        let cleaned = value.trim();
-        if !cleaned.is_empty() && !cleaned.eq_ignore_ascii_case("replace_with_groq_api_key") {
-            return cleaned.to_string();
-        }
-    }
-
-    crate::config::LocalApiSettings::load_from_disk()
-        .map(|settings| settings.groq_api_key.trim().to_string())
-        .filter(|key| !key.is_empty())
-        .unwrap_or_default()
-}
-
-fn build_groq_prompt(dictionary_hints: &[String]) -> Option<String> {
-    let hints = dictionary_hints
-        .iter()
-        .map(|hint| hint.trim())
-        .filter(|hint| !hint.is_empty())
-        .take(20)
-        .collect::<Vec<_>>();
-
-    if hints.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "Recognize these names or terms if spoken: {}",
-            hints.join(", ")
-        ))
-    }
-}
 
 /// Extract a number from text (for brightness level, volume, etc.)
 fn extract_number(text: &str) -> Option<u32> {
@@ -218,7 +183,7 @@ fn post_process_dictation(text: &str) -> String {
     result
 }
 
-/// Context metadata sent with every request
+/// Context metadata associated with a voice request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceContext {
     pub active_app: Option<String>,
@@ -246,16 +211,7 @@ impl Default for VoiceContext {
     }
 }
 
-/// Transcription result from cloud STT
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionResult {
-    pub text: String,
-    pub confidence: f32,
-    pub duration_ms: u64,
-    pub is_final: bool,
-}
-
-/// LLM action result
+/// Routed action result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
     pub action_type: ActionType,
@@ -355,94 +311,12 @@ pub enum ActionType {
     WindowControl, // Control windows (minimize, maximize, close, etc.)
 }
 
-/// Voice client for transcription and local routing
-pub struct VoiceClient {
-    client: Client,
-}
+/// Deterministic local router for already-transcribed speech.
+pub struct VoiceRouter;
 
-impl VoiceClient {
+impl VoiceRouter {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
-    }
-
-    /// Transcribe audio using Groq Whisper.
-    ///
-    /// `dictionary_hints` - Optional list of custom words/names to help recognition
-    pub async fn transcribe(&self, audio_data: &[u8]) -> Result<TranscriptionResult, String> {
-        self.transcribe_with_hints(audio_data, &[], None).await
-    }
-
-    /// Transcribe audio with custom vocabulary hints
-    pub async fn transcribe_with_hints(
-        &self,
-        audio_data: &[u8],
-        dictionary_hints: &[String],
-        language: Option<&str>,
-    ) -> Result<TranscriptionResult, String> {
-        // Rate limiting disabled for testing
-        // crate::rate_limit::check_stt_limit()?;
-
-        let api_key = get_groq_key();
-        if api_key.is_empty() {
-            return Err(
-                "Groq API key not found. Set GROQ_API_KEY or save it in Settings.".to_string(),
-            );
-        }
-
-        let file_part = Part::bytes(audio_data.to_vec())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")
-            .map_err(|e| format!("Failed to prepare Groq audio upload: {}", e))?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", "whisper-large-v3")
-            .text("response_format", "json")
-            .text("temperature", "0");
-
-        if let Some(lang) = language {
-            let normalized = lang.trim().to_lowercase();
-            if !normalized.is_empty() && normalized != "auto" {
-                form = form.text("language", normalized);
-            }
-        }
-
-        if let Some(prompt) = build_groq_prompt(dictionary_hints) {
-            form = form.text("prompt", prompt);
-        }
-
-        let response = self
-            .client
-            .post("https://api.groq.com/openai/v1/audio/transcriptions")
-            .bearer_auth(api_key)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| format!("Groq transcription request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("Groq transcription API error: {}", error_text));
-        }
-
-        #[derive(Deserialize)]
-        struct GroqTranscriptionResponse {
-            text: String,
-        }
-
-        let result: GroqTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse Groq transcription response: {}", e))?;
-
-        Ok(TranscriptionResult {
-            text: result.text,
-            confidence: 0.0,
-            duration_ms: 0,
-            is_final: true,
-        })
+        Self
     }
 
     /// Process text with full conversation context for multi-turn dialogues
@@ -1251,99 +1125,21 @@ impl VoiceClient {
     }
 }
 
-impl Default for VoiceClient {
+impl Default for VoiceRouter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[allow(dead_code)]
-/// Groq speech client helper.
-pub struct GroqClient {
-    client: Client,
-}
-
-#[allow(dead_code)]
-impl GroqClient {
-    pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
-    }
-
-    /// Get the file transcription endpoint.
-    pub fn get_transcription_url(&self) -> &'static str {
-        "https://api.groq.com/openai/v1/audio/transcriptions"
-    }
-}
-
-impl Default for GroqClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Public helper for deterministic command routing without calling the LLM.
+/// Public helper for deterministic command routing.
 /// Returns `Some(ActionResult)` only for unambiguous command phrases.
 pub fn detect_local_command(text: &str) -> Option<ActionResult> {
-    VoiceClient::new().detect_local_command(text)
-}
-
-/// Encode PCM samples to WAV format for API upload
-pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
-    use hound::{SampleFormat, WavSpec, WavWriter};
-    use std::io::Cursor;
-
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-
-    let mut buffer = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut buffer, spec)
-            .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
-
-        for &sample in samples {
-            let sample_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            writer
-                .write_sample(sample_i16)
-                .map_err(|e| format!("Failed to write sample: {}", e))?;
-        }
-
-        writer
-            .finalize()
-            .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
-    }
-
-    Ok(buffer.into_inner())
+    VoiceRouter::new().detect_local_command(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn groq_prompt_omits_empty_hints() {
-        assert!(build_groq_prompt(&[]).is_none());
-        assert!(build_groq_prompt(&["   ".to_string()]).is_none());
-    }
-
-    #[test]
-    fn groq_prompt_includes_trimmed_terms() {
-        let prompt = build_groq_prompt(&[
-            "  Electron  ".to_string(),
-            "Groq".to_string(),
-            "".to_string(),
-        ])
-        .expect("prompt");
-
-        assert!(prompt.contains("Electron"));
-        assert!(prompt.contains("Groq"));
-        assert!(!prompt.contains("  "));
-    }
 
     #[test]
     fn detects_specific_song_play_requests() {
@@ -1363,27 +1159,5 @@ mod tests {
         assert_eq!(action.action_type, ActionType::SpotifyControl);
         assert_eq!(action.payload["action"], "play_song");
         assert_eq!(action.payload["query"], "some lofi music on youtube");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires LISTEN_OS_GROQ_E2E_AUDIO_FILE, LISTEN_OS_GROQ_E2E_EXPECT, and GROQ_API_KEY"]
-    async fn groq_transcription_fixture_roundtrip() {
-        let audio_path = std::env::var("LISTEN_OS_GROQ_E2E_AUDIO_FILE")
-            .expect("LISTEN_OS_GROQ_E2E_AUDIO_FILE must be set");
-        let expected = std::env::var("LISTEN_OS_GROQ_E2E_EXPECT")
-            .expect("LISTEN_OS_GROQ_E2E_EXPECT must be set")
-            .to_lowercase();
-        let audio = std::fs::read(&audio_path).expect("audio fixture should be readable");
-
-        let result = VoiceClient::new()
-            .transcribe_with_hints(&audio, &[], Some("en"))
-            .await
-            .expect("Groq transcription should succeed");
-
-        assert!(
-            result.text.to_lowercase().contains(&expected),
-            "expected transcription to contain '{expected}', got '{}'",
-            result.text
-        );
     }
 }

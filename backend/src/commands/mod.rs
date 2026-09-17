@@ -1,20 +1,17 @@
 //! Desktop command handlers for ListenOS.
 //!
-//! Cloud-first architecture with embedded API keys.
-//! Users just speak - we handle everything.
+//! Native voice command and dictation handling.
 
 pub mod custom;
 
 use crate::audio::AudioDevice;
-use crate::cloud::{
-    self, ActionResult, ActionType, ConversationContext, VoiceClient, VoiceContext, VoiceMode,
-};
-use crate::config::{
-    LanguagePreferences, LocalApiSettings, VibeActivationMode, VibeCodingConfig, VibeTargetTool,
-};
+use crate::config::{LanguagePreferences, VibeActivationMode, VibeCodingConfig, VibeTargetTool};
 use crate::delivery::{
     capture_surface_snapshot, strategy_chain, verify_inserted_text, DeliveryPhase,
     DeliveryStatusSnapshot, DeliveryStrategy,
+};
+use crate::voice::{
+    self, ActionResult, ActionType, ConversationContext, VoiceContext, VoiceMode, VoiceRouter,
 };
 use crate::{AppState, State};
 use serde::{Deserialize, Serialize};
@@ -486,6 +483,8 @@ async fn enhance_vibe_coding_prompt(
 
 /// Start listening for voice input
 pub async fn start_listening(state: State<'_, AppState>) -> Result<bool, String> {
+    state.transcription.ensure_ready()?;
+
     let mut is_listening = state.is_listening.lock().await;
 
     if *is_listening {
@@ -500,12 +499,6 @@ pub async fn start_listening(state: State<'_, AppState>) -> Result<bool, String>
     }
     tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
 
-    // Clear accumulator
-    {
-        let mut accumulator = state.accumulator.lock().await;
-        accumulator.clear();
-    }
-
     if let Ok(mut delivery) = state.delivery.lock() {
         delivery.reset();
     }
@@ -516,28 +509,35 @@ pub async fn start_listening(state: State<'_, AppState>) -> Result<bool, String>
         audio.selected_device.clone()
     };
 
-    let receiver = {
-        let streamer = state.streamer.lock().await;
-        streamer.start_streaming(preferred_device.as_deref())?
-    };
-    let stream_sample_rate = {
-        let streamer = state.streamer.lock().await;
-        streamer.current_sample_rate()
-    };
     {
-        let mut accumulator = state.accumulator.lock().await;
-        accumulator.set_sample_rate(stream_sample_rate);
+        let streamer = state.streamer.lock().await;
+        streamer.start_streaming(preferred_device.as_deref())?;
     }
 
     *is_listening = true;
 
-    crate::streaming::spawn_audio_receiver_task(
-        receiver,
-        state.accumulator.clone(),
-        state.is_listening.clone(),
-    );
-
     log::info!("Listen OS: Started listening");
+
+    Ok(true)
+}
+
+/// Stop capture without transcribing or executing an action.
+pub async fn cancel_listening(state: State<'_, AppState>) -> Result<bool, String> {
+    {
+        let mut is_listening = state.is_listening.lock().await;
+        *is_listening = false;
+    }
+
+    {
+        let streamer = state.streamer.lock().await;
+        streamer.stop_streaming();
+        streamer.clear_samples();
+    }
+
+    {
+        let mut is_processing = state.is_processing.lock().await;
+        *is_processing = false;
+    }
 
     Ok(true)
 }
@@ -568,9 +568,6 @@ pub async fn stop_listening(
         streamer.stop_streaming();
     }
 
-    // Brief yield for final audio chunks to flush
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     // Set processing state
     {
         let mut is_processing = state.is_processing.lock().await;
@@ -579,10 +576,10 @@ pub async fn stop_listening(
 
     // Get accumulated audio
     let (samples, sample_rate) = {
-        let accumulator = state.accumulator.lock().await;
+        let streamer = state.streamer.lock().await;
         (
-            accumulator.get_samples().to_vec(),
-            accumulator.sample_rate(),
+            streamer.get_accumulated_samples(),
+            streamer.current_sample_rate(),
         )
     };
 
@@ -612,80 +609,23 @@ pub async fn stop_listening(
         active_ratio
     );
 
-    if samples.is_empty() || samples.len() < 1600 {
+    let minimum_samples = (sample_rate as usize / 10).max(1);
+    if samples.len() < minimum_samples {
         // Less than 100ms
         let mut is_processing = state.is_processing.lock().await;
         *is_processing = false;
         return Err("Recording too short.".to_string());
     }
 
-    // Encode to WAV
-    let wav_data = cloud::encode_wav(&samples, sample_rate)?;
-    log::info!("Encoded WAV: {} bytes", wav_data.len());
-
-    // Get context
-    let context = state.current_context.lock().await.clone();
-
-    // Load dictionary words for recognition hints
-    let dictionary_hints = match crate::dictionary::DictionaryStore::new() {
-        Ok(store) => store.get_words_for_recognition().unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let (language_preferences, vibe_config) = {
-        let config = state.config.lock().await;
-        (
-            normalized_language_preferences(&config.language_preferences),
-            normalized_vibe_coding_config(&config.vibe_coding),
-        )
-    };
-    let transcription_language_hint = language_preferences
-        .transcription_language_hint()
-        .map(|s| s.to_string());
-
-    let mut transcription = {
-        let voice_client = VoiceClient::new();
-        match voice_client
-            .transcribe_with_hints(
-                &wav_data,
-                &dictionary_hints,
-                transcription_language_hint.as_deref(),
-            )
-            .await
-        {
-            Ok(result) => TranscriptionResult {
-                text: result.text,
-                duration_ms,
-                confidence: result.confidence,
-                is_final: result.is_final,
-            },
-            Err(transcription_err) => {
-                log::error!("Transcription failed: {}", transcription_err);
-                {
-                    let mut error_log = state.error_log.lock().await;
-                    error_log.log_error_with_details(
-                        crate::error_log::ErrorType::Transcription,
-                        "Voice transcription failed",
-                        transcription_err.clone(),
-                    );
-                }
-                let mut is_processing = state.is_processing.lock().await;
-                *is_processing = false;
-                return Err(format!("Transcription failed: {}", transcription_err));
-            }
-        }
-    };
-
-    // Hard silence gate:
-    // If there is no meaningful audio energy, ignore transcription completely
-    // so random hallucinated text never gets pasted.
+    // Gate silence before local inference. Besides avoiding wasted CPU this prevents
+    // Whisper from hallucinating stock phrases when the microphone captured only noise.
     let is_low_signal = rms < 0.0028 && peak < 0.02 && active_ratio < 0.01;
     if is_low_signal {
         log::info!(
-            "No speech detected (low signal): rms={:.4}, peak={:.4}, active_ratio={:.4}, text='{}'",
+            "No speech detected before transcription: rms={:.4}, peak={:.4}, active_ratio={:.4}",
             rms,
             peak,
-            active_ratio,
-            transcription.text
+            active_ratio
         );
         let mut is_processing = state.is_processing.lock().await;
         *is_processing = false;
@@ -714,6 +654,59 @@ pub async fn stop_listening(
                 .unwrap_or_default(),
         });
     }
+
+    // Get context
+    let context = state.current_context.lock().await.clone();
+
+    // Load dictionary words for recognition hints
+    let dictionary_hints = match crate::dictionary::DictionaryStore::new() {
+        Ok(store) => store.get_words_for_recognition().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let (language_preferences, vibe_config) = {
+        let config = state.config.lock().await;
+        (
+            normalized_language_preferences(&config.language_preferences),
+            normalized_vibe_coding_config(&config.vibe_coding),
+        )
+    };
+    let transcription_language_hint = language_preferences
+        .transcription_language_hint()
+        .map(|s| s.to_string());
+
+    let mut transcription = {
+        match state
+            .transcription
+            .transcribe(
+                samples,
+                sample_rate,
+                transcription_language_hint,
+                dictionary_hints,
+            )
+            .await
+        {
+            Ok(text) => TranscriptionResult {
+                text,
+                duration_ms,
+                confidence: 0.0,
+                is_final: true,
+            },
+            Err(transcription_err) => {
+                log::error!("Transcription failed: {}", transcription_err);
+                {
+                    let mut error_log = state.error_log.lock().await;
+                    error_log.log_error_with_details(
+                        crate::error_log::ErrorType::Transcription,
+                        "Voice transcription failed",
+                        transcription_err.clone(),
+                    );
+                }
+                let mut is_processing = state.is_processing.lock().await;
+                *is_processing = false;
+                return Err(format!("Transcription failed: {}", transcription_err));
+            }
+        }
+    };
 
     // Also filter known Whisper hallucination phrases that appear on silence
     let hallucination_phrases = [
@@ -829,15 +822,15 @@ pub async fn stop_listening(
         )
     };
 
-    let local_router_action = cloud::detect_local_command(&intent_text);
+    let local_router_action = voice::detect_local_command(&intent_text);
 
     // Intent routing:
     // 1) Deterministic local router first for explicit command phrases
     // 2) Use local intent parser
     // 3) On failure, default to dictation
     let resolve_intent_action = || async {
-        let voice_client = VoiceClient::new();
-        match voice_client
+        let voice_router = VoiceRouter::new();
+        match voice_router
             .process_intent_with_context(&intent_text, &context, &conv_context)
             .await
         {
@@ -891,7 +884,7 @@ pub async fn stop_listening(
         );
         local_action
     } else if should_route_locally_first(&intent_text, &context) {
-        if let Some(local_action) = cloud::detect_local_command(&intent_text) {
+        if let Some(local_action) = voice::detect_local_command(&intent_text) {
             log::info!(
                 "Local router first selected action {:?} for transcript '{}'",
                 local_action.action_type,
@@ -908,7 +901,7 @@ pub async fn stop_listening(
     // Deterministic local router fallback.
     // If generic dictation is returned for an obvious command phrase, prefer local action routing.
     if !dictation_only && should_use_local_command_fallback(&intent_text, &context, &action) {
-        if let Some(local_action) = cloud::detect_local_command(&intent_text) {
+        if let Some(local_action) = voice::detect_local_command(&intent_text) {
             log::info!(
                 "Local router fallback selected action {:?} for transcript '{}'",
                 local_action.action_type,
@@ -1316,6 +1309,40 @@ pub async fn set_audio_device(
     audio.selected_device = Some(cleaned_name.to_string());
     log::info!("Set audio device to {}", cleaned_name);
     Ok(true)
+}
+
+// ============ Local Transcription Commands ============
+
+pub async fn list_local_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::LocalModelInfo>, String> {
+    state.transcription.list_models()
+}
+
+pub async fn get_transcription_settings(
+    state: State<'_, AppState>,
+) -> Result<crate::TranscriptionSettings, String> {
+    Ok(state.transcription.settings())
+}
+
+pub async fn set_transcription_model(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<crate::TranscriptionSettings, String> {
+    state.transcription.set_model(&model)
+}
+
+pub async fn get_transcription_runtime_status(
+    state: State<'_, AppState>,
+) -> Result<crate::TranscriptionRuntimeStatus, String> {
+    Ok(state.transcription.runtime_status())
+}
+
+pub async fn download_local_model(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<crate::LocalModelInfo, String> {
+    state.transcription.download_model(&model).await
 }
 
 fn trim_spoken_punctuation(value: &str) -> String {
@@ -3063,8 +3090,8 @@ async fn execute_clipboard_action(
     };
 
     // Process with local clipboard transformer
-    let client = VoiceClient::new();
-    let result = client
+    let router = VoiceRouter::new();
+    let result = router
         .process_clipboard(&content, operation, &action.payload)
         .await?;
 
@@ -3587,27 +3614,6 @@ pub async fn set_vibe_coding_config(
     }
 
     Ok(normalized)
-}
-
-fn sanitize_groq_api_key(raw: &str) -> String {
-    let cleaned = raw.trim().to_string();
-    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("replace_with_groq_api_key") {
-        String::new()
-    } else {
-        cleaned
-    }
-}
-
-pub async fn get_local_api_settings() -> Result<LocalApiSettings, String> {
-    Ok(LocalApiSettings::load_from_disk().unwrap_or_default())
-}
-
-pub async fn set_local_api_settings(groq_api_key: String) -> Result<LocalApiSettings, String> {
-    let settings = LocalApiSettings {
-        groq_api_key: sanitize_groq_api_key(&groq_api_key),
-    };
-    settings.save_to_disk()?;
-    Ok(settings)
 }
 
 // ============ Custom Commands ============

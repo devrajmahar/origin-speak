@@ -40,7 +40,7 @@ Use this checklist on a real macOS machine after installing from the generated D
    - Snippets
    - Tone
 2. Confirm notes page is not present in sidebar navigation.
-3. Open `Settings` and verify System section can save Groq API key.
+3. Open `Settings -> System` and verify the local transcription model can be selected, downloaded, and reports `Ready` after installation.
 
 ## Files and System Actions
 

@@ -2,7 +2,6 @@
 //!
 //! Handles microphone input capture using the `cpal` library.
 
-use base64::Engine;
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -101,22 +100,4 @@ impl AudioState {
             samples.extend_from_slice(new_samples);
         }
     }
-}
-
-/// Convert f32 samples to i16 PCM (for Whisper)
-pub fn samples_to_pcm(samples: &[f32]) -> Vec<i16> {
-    samples
-        .iter()
-        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
-        .collect()
-}
-
-/// Encode audio samples to base64 PCM format
-/// Returns base64-encoded raw PCM data
-#[allow(dead_code)]
-pub fn samples_to_base64_pcm(samples: &[f32], _sample_rate: u32) -> Result<String, String> {
-    let pcm_data = samples_to_pcm(samples);
-    let bytes: Vec<u8> = pcm_data.iter().flat_map(|&s| s.to_le_bytes()).collect();
-
-    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }

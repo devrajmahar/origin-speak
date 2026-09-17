@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::cloud::ActionType;
+use crate::voice::ActionType;
 
 /// Maximum messages to keep in short-term memory for LLM context
 const MAX_SHORT_TERM_MESSAGES: usize = 10;

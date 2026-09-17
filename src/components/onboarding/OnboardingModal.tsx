@@ -4,12 +4,20 @@ import {
   isElectron,
   getAudioDevices,
   setAudioDevice,
-  getLocalApiSettings,
-  setLocalApiSettings,
+  startListening,
+  cancelListening,
+  getAudioLevel,
+  listLocalModels,
+  getTranscriptionSettings,
+  setTranscriptionModel,
+  getTranscriptionRuntimeStatus,
+  downloadLocalModel,
   getCommandTemplates,
   saveCustomCommand,
   type AudioDevice,
   type CustomCommand,
+  type LocalModelInfo,
+  type TranscriptionRuntimeStatus,
 } from "@/lib/desktop";
 
 interface OnboardingModalProps {
@@ -17,7 +25,11 @@ interface OnboardingModalProps {
   onComplete: () => void;
 }
 
-type Step = "welcome" | "api-key" | "microphone" | "test" | "commands" | "complete";
+type Step = "welcome" | "model" | "microphone" | "test" | "commands" | "complete";
+
+function currentModelId(settings: { model: string }): string {
+  return settings.model;
+}
 
 function isHandsFreeDeviceName(name: string): boolean {
   const normalized = name.toLowerCase();
@@ -37,29 +49,62 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
   const [selectedTemplates, setSelectedTemplates] = useState<Set<string>>(new Set());
   const [isTestingMic, setIsTestingMic] = useState(false);
   const [testSuccess, setTestSuccess] = useState(false);
-  const [groqApiKey, setGroqApiKey] = useState("");
-  const [apiSettingsSaving, setApiSettingsSaving] = useState(false);
-  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
+  const [micTestError, setMicTestError] = useState<string | null>(null);
+  const [models, setModels] = useState<LocalModelInfo[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [runtimeStatus, setRuntimeStatus] = useState<TranscriptionRuntimeStatus | null>(null);
+  const [modelSetupBusy, setModelSetupBusy] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     try {
-      const [devs, tmpls, localApi] = await Promise.all([
-        getAudioDevices(),
-        getCommandTemplates(),
-        getLocalApiSettings(),
+      const [localModels, transcriptionSettings, status] = await Promise.all([
+        listLocalModels(),
+        getTranscriptionSettings(),
+        getTranscriptionRuntimeStatus(),
       ]);
+      setModels(localModels);
+      setRuntimeStatus(status);
+      const configuredModel = currentModelId(transcriptionSettings);
+      const defaultModel = localModels.find((model) => model.id === configuredModel)
+        ?? localModels.find((model) => model.selected)
+        ?? localModels.find((model) => model.downloaded)
+        ?? localModels[0];
+      setSelectedModel(defaultModel?.id ?? configuredModel);
+      setModelError(null);
+    } catch (error) {
+      console.error("Failed to load local model setup:", error);
+      setModelError(error instanceof Error ? error.message : "Failed to load local model setup.");
+    }
+
+    try {
+      const devs = await getAudioDevices();
       setDevices(devs);
-      setTemplates(tmpls);
-      setGroqApiKey(localApi.groq_api_key ?? "");
-      
+      setDeviceError(null);
+
       // Select a safe default device (avoid hands-free profiles that can hijack output).
       const defaultDevice = devs.find((d) => d.is_default && !isHandsFreeDeviceName(d.name))
         ?? devs.find((d) => !isHandsFreeDeviceName(d.name));
       if (defaultDevice) {
         setSelectedDevice(defaultDevice.name);
+      } else {
+        setSelectedDevice("");
+        setDeviceError("No supported microphone is available. Check microphone permission or connect another input, then retry.");
       }
     } catch (error) {
-      console.error("Failed to load onboarding data:", error);
+      console.error("Failed to load onboarding device data:", error);
+      setDevices([]);
+      setSelectedDevice("");
+      setDeviceError(error instanceof Error
+        ? error.message
+        : "Could not access microphones. Check microphone permission and retry.");
+    }
+
+    try {
+      setTemplates(await getCommandTemplates());
+    } catch (error) {
+      console.error("Failed to load onboarding command templates:", error);
+      setTemplates([]);
     }
   }, []);
 
@@ -94,37 +139,67 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
     }
   };
 
-  const handleApiKeyContinue = async () => {
-    const cleaned = groqApiKey.trim();
-    if (!cleaned) {
-      setApiKeyError("Groq API key is required.");
+  const handleModelContinue = async () => {
+    if (!selectedModel) {
+      setModelError("Choose a local transcription model.");
       return;
     }
 
-    setApiKeyError(null);
-    if (!isElectron()) {
-      nextStep();
-      return;
-    }
-
-    setApiSettingsSaving(true);
+    setModelSetupBusy(true);
+    setModelError(null);
     try {
-      await setLocalApiSettings(cleaned);
+      const selected = models.find((model) => model.id === selectedModel);
+      if (selected && !selected.downloaded) {
+        await downloadLocalModel(selectedModel);
+      }
+      await setTranscriptionModel(selectedModel);
+      const [updatedModels, status] = await Promise.all([
+        listLocalModels(),
+        getTranscriptionRuntimeStatus(),
+      ]);
+      setModels(updatedModels);
+      setRuntimeStatus(status);
       nextStep();
     } catch (error) {
-      console.error("Failed to save Groq API key:", error);
-      setApiKeyError("Failed to save key. Please try again.");
+      console.error("Failed to set up local transcription model:", error);
+      setModelError(error instanceof Error ? error.message : "Failed to set up the local model.");
     } finally {
-      setApiSettingsSaving(false);
+      setModelSetupBusy(false);
     }
   };
 
   const handleTestMic = async () => {
     setIsTestingMic(true);
-    // Simulate mic test - in real implementation, would actually record and check levels
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    setIsTestingMic(false);
-    setTestSuccess(true);
+    setTestSuccess(false);
+    setMicTestError(null);
+
+    let captureStarted = false;
+    try {
+      if (selectedDevice) {
+        await setAudioDevice(selectedDevice);
+      }
+      await startListening();
+      captureStarted = true;
+
+      let peak = 0;
+      for (let attempt = 0; attempt < 18; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        peak = Math.max(peak, await getAudioLevel());
+      }
+
+      if (peak < 0.015) {
+        setMicTestError("No microphone signal was detected. Speak while the test is running, check the selected input, or skip this test.");
+      } else {
+        setTestSuccess(true);
+      }
+    } catch (error) {
+      setMicTestError(error instanceof Error ? error.message : "Microphone test failed.");
+    } finally {
+      if (captureStarted) {
+        await cancelListening().catch(() => undefined);
+      }
+      setIsTestingMic(false);
+    }
   };
 
   const handleTemplateToggle = (id: string) => {
@@ -160,17 +235,8 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
     onComplete();
   };
 
-  const hasSavedApiKey = groqApiKey.trim().length > 0;
-  const steps: Step[] = hasSavedApiKey
-    ? ["welcome", "microphone", "test", "commands", "complete"]
-    : ["welcome", "api-key", "microphone", "test", "commands", "complete"];
+  const steps: Step[] = ["welcome", "model", "microphone", "test", "commands", "complete"];
   const currentStepIndex = steps.indexOf(step);
-
-  useEffect(() => {
-    if (hasSavedApiKey && step === "api-key") {
-      setStep("microphone");
-    }
-  }, [hasSavedApiKey, step]);
 
   const nextStep = () => {
     const nextIndex = currentStepIndex + 1;
@@ -296,7 +362,16 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
                 })}
               </div>
               {deviceError && (
-                <p className="mb-3 text-xs text-negative">{deviceError}</p>
+                <div className="mb-3 flex items-center justify-between gap-3 rounded-df border border-negative/20 bg-negative/5 p-3">
+                  <p className="text-xs text-negative">{deviceError}</p>
+                  <button
+                    type="button"
+                    onClick={() => void loadData()}
+                    className="ui-button ui-button-outline shrink-0 rounded-df border border-muted-border bg-muted px-2.5 py-1.5 text-xs text-foreground hover:bg-accent"
+                  >
+                    Retry
+                  </button>
+                </div>
               )}
 
               <div className="flex gap-2">
@@ -317,46 +392,105 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
             </motion.div>
           )}
 
-          {step === "api-key" && (
+          {step === "model" && (
             <motion.div
-              key="api-key"
+              key="model"
               initial={{ opacity: 0, x: 10 }}
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: -10 }}
               transition={{ duration: 0.15 }}
             >
-              <h2 className="mb-1.5 text-lg font-normal text-foreground">Add your Groq API key</h2>
+              <h2 className="mb-1.5 text-lg font-normal text-foreground">Set up local transcription</h2>
               <p className="mb-4 text-sm text-muted-foreground">
-                ListenOS uses Groq Whisper Large v3 for self-hosted voice transcription.
+                Choose a speech model. ListenOS will keep dictation on this device and download the model if needed.
               </p>
 
-              <div className="mb-4 space-y-2">
-                <input
-                  type="password"
-                  value={groqApiKey}
-                  onChange={(e) => setGroqApiKey(e.target.value)}
-                  placeholder="gsk_..."
-                  className="ui-input w-full rounded-df border border-muted-border bg-input px-3 py-2 text-sm text-foreground"
-                  disabled={apiSettingsSaving}
-                />
-                {apiKeyError && <p className="text-xs text-negative">{apiKeyError}</p>}
-                <p className="text-xs text-muted-foreground">Get your key at console.groq.com.</p>
+              <div className="mb-4 max-h-52 space-y-2 overflow-y-auto">
+                {models.map((model) => {
+                  const selected = selectedModel === model.id;
+                  return (
+                    <button
+                      key={model.id}
+                      type="button"
+                      onClick={() => setSelectedModel(model.id)}
+                      disabled={modelSetupBusy}
+                      className={`ui-button flex w-full items-start gap-3 rounded-df border p-3 text-left transition-colors ${
+                        selected ? "border-primary bg-primary/10" : "border-muted-border bg-muted hover:bg-accent"
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-normal text-foreground">{model.label || model.id}</span>
+                          {model.selected && (
+                            <span className="rounded-df bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">Current</span>
+                          )}
+                        </div>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          {[model.filename, model.downloaded ? "Downloaded" : "Download required"]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </p>
+                      </div>
+                      <div className={`mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-df border ${
+                        selected ? "border-primary bg-primary" : "border-border"
+                      }`}>
+                        {selected && (
+                          <svg className="h-2.5 w-2.5 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                          </svg>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+                {models.length === 0 && !modelError && (
+                  <div className="rounded-df border border-muted-border bg-muted p-3 text-sm text-muted-foreground">
+                    Loading local models...
+                  </div>
+                )}
+                {runtimeStatus?.phase === "Ready" && (
+                  <p className="text-xs text-positive">
+                    Local transcription is ready with {runtimeStatus.model}.
+                  </p>
+                )}
+                {runtimeStatus?.phase === "ModelMissing" && !modelError && (
+                  <p className="text-xs text-muted-foreground">
+                    {runtimeStatus.model} is selected and needs to be downloaded before dictation can start.
+                  </p>
+                )}
+                {modelError && (
+                  <div className="flex items-center justify-between gap-3 rounded-df border border-negative/20 bg-negative/5 p-3">
+                    <p className="text-xs text-negative">{modelError}</p>
+                    <button
+                      type="button"
+                      onClick={() => void loadData()}
+                      disabled={modelSetupBusy}
+                      className="ui-button ui-button-outline shrink-0 rounded-df border border-muted-border bg-muted px-2.5 py-1.5 text-xs text-foreground hover:bg-accent"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-2">
                 <button
                   onClick={prevStep}
-                  disabled={apiSettingsSaving}
+                  disabled={modelSetupBusy}
                   className="ui-button ui-button-outline flex-1 rounded-df border border-muted-border bg-muted px-4 py-2 text-sm font-normal text-foreground hover:bg-accent"
                 >
                   Back
                 </button>
                 <button
-                  onClick={() => void handleApiKeyContinue()}
-                  disabled={apiSettingsSaving || groqApiKey.trim().length === 0}
+                  onClick={() => void handleModelContinue()}
+                  disabled={modelSetupBusy || !selectedModel}
                   className="ui-button ui-button-primary flex-1 rounded-df bg-primary px-4 py-2 text-sm font-normal text-primary-foreground hover:bg-primary-hover disabled:opacity-50"
                 >
-                  {apiSettingsSaving ? "Saving..." : "Continue"}
+                  {modelSetupBusy
+                    ? "Setting up..."
+                    : models.find((model) => model.id === selectedModel)?.downloaded
+                      ? "Continue"
+                      : "Download & continue"}
                 </button>
               </div>
             </motion.div>
@@ -416,9 +550,12 @@ export function OnboardingModal({ isOpen, onComplete }: OnboardingModalProps) {
                 {isTestingMic
                   ? "Listening..."
                   : testSuccess
-                  ? "Your microphone is working!"
+                  ? "Microphone input detected."
                   : "Click to test your microphone."}
               </p>
+              {micTestError && (
+                <p className="mb-4 text-xs text-negative">{micTestError}</p>
+              )}
 
               <div className="flex gap-2">
                 <button

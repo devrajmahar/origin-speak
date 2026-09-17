@@ -11,7 +11,7 @@ ListenOS uses Electron for the desktop shell, a React interface bundled by Rspac
 - Push-to-talk dictation and assistant mode with global shortcuts
 - Voice-to-action command execution
 - Local settings, conversations, clipboard history, dictionary, notes, and snippets
-- Configurable shortcuts, language preferences, microphone, and Groq API key
+- Configurable shortcuts, language preferences, microphone, and local Whisper model
 - Native tray, deep links, autostart, single-instance handling, and auto-updates
 - Sandboxed renderer with a narrow Electron preload API
 
@@ -41,10 +41,17 @@ npm install
 npm run desktop:dev
 ```
 
-Set the Groq key in `Settings -> System`, or create `.env.local`:
+Dictation runs locally with Whisper and does not require an API key. During first-run model setup, ListenOS downloads the default `base.en` model into the per-user ListenOS models directory:
+
+```text
+<user data directory>/ListenOS/models
+```
+
+You can choose or download another supported local model later from `Settings -> System`.
+
+Optional runtime configuration can still be placed in `.env.local`:
 
 ```env
-GROQ_API_KEY=your_groq_api_key_here
 LISTENOS_REQUIRE_CONFIRMATION=false
 ```
 
@@ -89,13 +96,13 @@ ListenOS/
 |       |-- ipc.rs        # Line-delimited JSON-RPC server
 |       |-- commands/     # Voice and automation command handlers
 |       |-- audio/
-|       |-- cloud/
+|       |-- transcription/ # Local Whisper model management and inference
 |       `-- streaming/
 `-- scripts/
     `-- electron-dev.mjs  # Rspack + Electron development launcher
 ```
 
-Electron owns desktop lifecycle concerns. The Rust child process owns audio capture, AI calls, persistence, global hotkeys, and native system automation. Renderer code cannot access Node.js or spawn arbitrary processes directly.
+Electron owns desktop lifecycle concerns. The Rust child process owns audio capture, local transcription, persistence, global hotkeys, and native system automation. Renderer code cannot access Node.js or spawn arbitrary processes directly.
 
 ## Scripts
 
@@ -127,4 +134,4 @@ Version helpers:
 
 ## License
 
-Proprietary software. See [LICENSE](LICENSE).
+Proprietary software. See [LICENSE](LICENSE). Third-party attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -4,6 +4,7 @@ import {
   isElectron,
   getStatus,
   startListening,
+  cancelListening,
   stopListening,
   getPendingAction,
   confirmPendingAction,
@@ -18,6 +19,18 @@ import {
 
 type AssistantState = "idle" | "listening" | "handsfree" | "processing" | "success" | "error";
 type NotificationType = "word-learned" | null;
+const ONBOARDING_COMPLETE_KEY = "listenos_onboarding_complete";
+
+function actionableBackendError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes("model") && (normalized.includes("missing") || normalized.includes("not found") || normalized.includes("download"))) {
+    return `${message} Open ListenOS Settings → System to download or select a local transcription model.`;
+  }
+
+  return message || "ListenOS could not process that recording.";
+}
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -238,14 +251,35 @@ export default function AssistantPage() {
       }
       setState("success");
       setTimeout(() => setState("idle"), isConvo ? 4500 : 1000);
-    } catch {
+    } catch (error) {
+      setStatusNotice(actionableBackendError(error));
       setState("error");
-      setTimeout(() => setState("idle"), 1200);
+      setTimeout(() => {
+        setStatusNotice(null);
+        setState("idle");
+      }, 4200);
     }
   }, []);
 
   const start = useCallback(async (handsfree = false) => {
     if (stateRef.current !== "idle" || pendingAction || isStartingRef.current) return;
+
+    if (isElectron()) {
+      try {
+        if (localStorage.getItem(ONBOARDING_COMPLETE_KEY) !== "true") {
+          setStatusNotice("Finish ListenOS setup in the dashboard before starting dictation.");
+          setState("error");
+          setTimeout(() => {
+            setStatusNotice(null);
+            setState("idle");
+          }, 3200);
+          return;
+        }
+      } catch {
+        // Backend readiness remains authoritative when browser storage is unavailable.
+      }
+    }
+
     isStartingRef.current = true;
     pendingStopRef.current = false;
     setState(handsfree ? "handsfree" : "listening");
@@ -257,9 +291,13 @@ export default function AssistantPage() {
 
     try {
       await startListening();
-    } catch {
+    } catch (error) {
+      setStatusNotice(actionableBackendError(error));
       setState("error");
-      setTimeout(() => setState("idle"), 1200);
+      setTimeout(() => {
+        setStatusNotice(null);
+        setState("idle");
+      }, 4200);
     } finally {
       isStartingRef.current = false;
       if (pendingStopRef.current) { pendingStopRef.current = false; void stopInternal(); }
@@ -284,7 +322,15 @@ export default function AssistantPage() {
     catch { setState("error"); setTimeout(() => setState("idle"), 1200); }
   }, [pendingAction]);
 
-  const cancel = useCallback(() => setState("idle"), []);
+  const cancel = useCallback(() => {
+    if (isElectron()) {
+      void cancelListening().catch((error) => {
+        console.warn("Failed to cancel microphone capture:", error);
+      });
+    }
+    setStatusNotice(null);
+    setState("idle");
+  }, []);
 
   const showBrowserPreview = useCallback((previewState: "listening" | "handsfree" | "processing" | "error") => {
     setStatusNotice(null);

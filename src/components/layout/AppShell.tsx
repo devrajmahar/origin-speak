@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Settings } from "@solar-icons/react";
 import { SettingsModal } from "./SettingsModal";
 import { WorkspaceMenu } from "./WorkspaceMenu";
+import { OnboardingModal } from "@/components/onboarding/OnboardingModal";
 import { TranscriptionProvider } from "@/context/TranscriptionContext";
 import { checkForUpdates } from "@/lib/updater";
 import { isElectron } from "@/lib/desktop";
@@ -10,8 +11,11 @@ interface AppShellProps {
   children: React.ReactNode;
 }
 
+const ONBOARDING_COMPLETE_KEY = "listenos_onboarding_complete";
+
 function AppShellContent({ children }: AppShellProps) {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const electronDesktop = isElectron();
 
@@ -23,6 +27,24 @@ function AppShellContent({ children }: AppShellProps) {
     if (!electronDesktop) return;
     void window.listenOS?.window.isMaximized().then(setIsWindowMaximized);
   }, [electronDesktop]);
+
+  useEffect(() => {
+    if (!electronDesktop) return;
+    try {
+      setIsOnboardingOpen(localStorage.getItem(ONBOARDING_COMPLETE_KEY) !== "true");
+    } catch {
+      setIsOnboardingOpen(true);
+    }
+  }, [electronDesktop]);
+
+  const handleOnboardingComplete = useCallback(() => {
+    try {
+      localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
+    } catch {
+      // The session can still continue if browser storage is unavailable.
+    }
+    setIsOnboardingOpen(false);
+  }, []);
 
   const handleWindowMinimize = useCallback(() => {
     if (!electronDesktop) return;
@@ -123,6 +145,7 @@ function AppShellContent({ children }: AppShellProps) {
       </main>
 
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      <OnboardingModal isOpen={isOnboardingOpen} onComplete={handleOnboardingComplete} />
     </>
   );
 }

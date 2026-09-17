@@ -14,12 +14,21 @@ Windows requires Visual Studio Build Tools with C++. macOS requires Xcode Comman
 
 ## Configure
 
-Set the Groq key in `Settings -> System`, or copy `.env.example` to `.env.local`:
+Dictation uses local Whisper inference and does not require a transcription API key. During first-run model setup, ListenOS downloads the default `base.en` model into the per-user models directory:
+
+```text
+<user data directory>/ListenOS/models
+```
+
+The exact user data root follows the operating system's standard application-data location. Model selection, download state, and runtime status are available in `Settings -> System`.
+
+If you want to change optional runtime behavior, copy `.env.example` to `.env.local`:
 
 ```env
-GROQ_API_KEY=your_groq_api_key
 LISTENOS_REQUIRE_CONFIRMATION=false
 ```
+
+After a model is downloaded, transcription runs locally on the machine. Network access is only needed when downloading a model.
 
 ## Develop
 

@@ -164,7 +164,12 @@ export async function startListening(): Promise<boolean> {
   return invoke("start_listening");
 }
 
-// Stop listening - processes audio with Groq Whisper, executes action, returns result
+// Cancel recording without transcription or action execution.
+export async function cancelListening(): Promise<boolean> {
+  return invoke("cancel_listening");
+}
+
+// Stop listening - processes audio with the configured local transcription model.
 export async function stopListening(dictationOnly = false): Promise<VoiceProcessingResult> {
   return invoke("stop_listening", {
     dictationOnly,
@@ -249,21 +254,52 @@ export async function setVibeCodingConfig(
   return invoke("set_vibe_coding_config", { config });
 }
 
-export interface LocalApiSettings {
-  groq_api_key: string;
+export interface LocalModelInfo {
+  id: string;
+  label: string;
+  filename: string;
+  path: string;
+  downloaded: boolean;
+  selected: boolean;
 }
 
-export async function getLocalApiSettings(): Promise<LocalApiSettings> {
-  return invoke("get_local_api_settings");
+export interface TranscriptionSettings {
+  model: string;
 }
 
-export async function setLocalApiSettings(
-  groqApiKey: string,
-): Promise<LocalApiSettings> {
-  return invoke("set_local_api_settings", {
-    groqApiKey,
-    groq_api_key: groqApiKey,
-  });
+export type TranscriptionRuntimePhase =
+  | "Ready"
+  | "ModelMissing"
+  | "Downloading"
+  | "Transcribing"
+  | "Error";
+
+export interface TranscriptionRuntimeStatus {
+  model: string;
+  model_path: string;
+  model_downloaded: boolean;
+  phase: TranscriptionRuntimePhase;
+  last_error: string | null;
+}
+
+export async function listLocalModels(): Promise<LocalModelInfo[]> {
+  return invoke("list_local_models");
+}
+
+export async function getTranscriptionSettings(): Promise<TranscriptionSettings> {
+  return invoke("get_transcription_settings");
+}
+
+export async function setTranscriptionModel(model: string): Promise<TranscriptionSettings> {
+  return invoke("set_transcription_model", { model });
+}
+
+export async function getTranscriptionRuntimeStatus(): Promise<TranscriptionRuntimeStatus> {
+  return invoke("get_transcription_runtime_status");
+}
+
+export async function downloadLocalModel(model: string): Promise<LocalModelInfo> {
+  return invoke("download_local_model", { model });
 }
 
 // ============ Action Commands ============

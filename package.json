@@ -74,6 +74,7 @@
       "electron/**/*",
       "out/**/*",
       "backend/icons/**/*",
+      "THIRD_PARTY_NOTICES.md",
       "package.json"
     ],
     "extraResources": [

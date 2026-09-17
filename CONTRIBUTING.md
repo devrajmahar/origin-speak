@@ -19,7 +19,7 @@ ListenOS is proprietary software. Coordinate with maintainers before starting ma
 
 - Desktop app is self-hosted first: do not reintroduce login-gated dashboard flows.
 - Keep first-run onboarding behavior intact unless a task explicitly requests temporary disablement.
-- Groq key configuration should remain available in `Settings -> System`.
+- Dictation is local-first and uses local Whisper models; do not add an API-key requirement to the transcription flow.
 - Voice flow should execute and transcribe without spoken voice playback.
 - Avoid Bluetooth hands-free microphone routing that can hijack headphone output.
 

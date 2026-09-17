@@ -20,10 +20,11 @@ protocol.registerSchemesAsPrivileged([
 const projectRoot = path.resolve(__dirname, "..");
 const devRendererUrl = process.env.ELECTRON_RENDERER_URL;
 const allowedCommands = new Set([
-  "start_listening", "stop_listening", "get_status", "get_audio_level",
+  "start_listening", "cancel_listening", "stop_listening", "get_status", "get_audio_level",
   "get_trigger_hotkey", "set_trigger_hotkey", "get_assistant_hotkey", "set_assistant_hotkey",
   "get_language_preferences", "set_language_preferences", "get_vibe_coding_config",
-  "set_vibe_coding_config", "get_local_api_settings", "set_local_api_settings", "type_text",
+  "set_vibe_coding_config", "list_local_models", "get_transcription_settings",
+  "set_transcription_model", "get_transcription_runtime_status", "download_local_model", "type_text",
   "run_system_command", "get_pending_action", "confirm_pending_action", "cancel_pending_action",
   "get_audio_devices", "set_audio_device", "get_history", "clear_history", "hide_assistant",
   "show_dashboard", "get_conversation", "clear_conversation", "new_conversation_session",
@@ -309,7 +310,7 @@ if (!hasSingleInstanceLock) {
           responseHeaders: {
             ...details.responseHeaders,
             "Content-Security-Policy": [
-              "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self' https://api.groq.com https://server-bay-omega-45.vercel.app https://*.vercel.app; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+              "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
             ],
           },
         }),
