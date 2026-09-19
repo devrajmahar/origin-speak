@@ -19,7 +19,7 @@ origin-speak-runtime-<version>-windows-x86_64.exe
 The manager installs the runtime into the per-user Origin Speak directory using Rust/native filesystem APIs. Runtime start/stop does not invoke `cmd.exe` or PowerShell. Local packages are unsigned unless `WINDOWS_SIGNING_CERTIFICATE_PATH`, `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`, and `WINDOWS_SIGN_TIMESTAMP_URL` are set.
 
 ```text
-powershell -NoProfile -File native/packaging/windows/package.ps1 -Version 0.1.23 -OutputDir dist/native/windows
+powershell -NoProfile -File native/packaging/windows/package.ps1 -Version 0.1.24 -OutputDir dist/native/windows
 ```
 
 The retired NSIS installer source is no longer part of the shipping tree. CLI uninstall contains exact cleanup for its historical registry keys, shortcuts, old executable, and `Uninstall.exe` so upgrades do not leave dead registrations behind.
@@ -36,7 +36,7 @@ origin-speak-runtime-<version>-macos-universal.zip
 Tagged releases build Apple Silicon and Intel manager/runtime binaries and merge each with `lipo`. With a complete Apple credential set the workflow applies Developer ID signing, notarization, and stapling; without it the package script uses ad-hoc code signing and publishes a clearly marked non-notarized build. There is no DMG in the CLI/bootstrap contract.
 
 ```text
-bash native/packaging/macos/package.sh 0.1.23 dist/native/macos
+bash native/packaging/macos/package.sh 0.1.24 dist/native/macos
 ```
 
 The runtime bundle keeps macOS 13.0 as its minimum version.
@@ -48,21 +48,21 @@ The runtime bundle keeps macOS 13.0 as its minimum version.
 ```json
 {
   "schema_version": 2,
-  "version": "0.1.23",
+  "version": "0.1.24",
   "platforms": {
     "windows-x86_64": {
       "manager": {
         "kind": "cli-manager",
         "arch": "x86_64",
-        "path": "origin-speak-0.1.23-windows-x86_64.exe",
-        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.23/origin-speak-0.1.23-windows-x86_64.exe",
+        "path": "origin-speak-0.1.24-windows-x86_64.exe",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.24/origin-speak-0.1.24-windows-x86_64.exe",
         "sha256": "<lowercase hex sha256>"
       },
       "runtime": {
         "kind": "silent-runtime",
         "arch": "x86_64",
-        "path": "origin-speak-runtime-0.1.23-windows-x86_64.exe",
-        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.23/origin-speak-runtime-0.1.23-windows-x86_64.exe",
+        "path": "origin-speak-runtime-0.1.24-windows-x86_64.exe",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.24/origin-speak-runtime-0.1.24-windows-x86_64.exe",
         "sha256": "<lowercase hex sha256>"
       }
     },
@@ -70,15 +70,15 @@ The runtime bundle keeps macOS 13.0 as its minimum version.
       "manager": {
         "kind": "cli-manager",
         "arch": "universal",
-        "path": "origin-speak-0.1.23-macos-universal",
-        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.23/origin-speak-0.1.23-macos-universal",
+        "path": "origin-speak-0.1.24-macos-universal",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.24/origin-speak-0.1.24-macos-universal",
         "sha256": "<lowercase hex sha256>"
       },
       "runtime": {
         "kind": "app-bundle-zip",
         "arch": "universal",
-        "path": "origin-speak-runtime-0.1.23-macos-universal.zip",
-        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.23/origin-speak-runtime-0.1.23-macos-universal.zip",
+        "path": "origin-speak-runtime-0.1.24-macos-universal.zip",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.24/origin-speak-runtime-0.1.24-macos-universal.zip",
         "sha256": "<lowercase hex sha256>"
       }
     }

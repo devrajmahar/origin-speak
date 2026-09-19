@@ -36,6 +36,7 @@ jobs:
     runs-on: windows-latest
     needs: metadata
     env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}\t
       WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
@@ -124,6 +125,8 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File native/packaging/windows/package.ps1
           -Version "${{ needs.metadata.outputs.version }}"
           -OutputDir "dist/native/windows"
+          -ManagerBinaryPath "$env:CARGO_TARGET_DIR\release\origin.exe"
+          -RuntimeBinaryPath "$env:CARGO_TARGET_DIR\release\origin-runtime.exe"
 
       - name: Record Windows trust status
         shell: pwsh
