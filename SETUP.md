@@ -74,10 +74,10 @@ Local transcription needs no API key. Origin Speak supports its whisper.cpp cata
 
 ## Default dictation hotkey
 
-- Windows: `Meta+Ctrl+Space`
-- macOS: `Ctrl+Space`
+- Windows: `Shift+Space`
+- macOS: `Shift+Space`
 
-There is one global shortcut only. Hold it to capture speech and release it to transcribe and type the result. Change it with `origin hotkey set <chord>`.
+There is one global shortcut only. Hold it to capture speech and release it to transcribe and type the result. Change it with `origin hotkey set <chord>`; a running resident runtime is restarted automatically so the new binding takes effect.
 
 The resident overlay exposes only four transient states: `Listening`, `Processing`, `Success`, and `Error`.
 

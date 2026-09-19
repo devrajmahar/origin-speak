@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use origin_speak_lib::{
     AppState, DeliveryPhase, ShortcutEvent, ShortcutService, State, VoiceProcessingResult,
-    get_audio_level, process_captured_audio, start_listening, take_capture_for_processing,
+    get_audio_level, normalize_hotkey_string, process_captured_audio, start_listening,
+    take_capture_for_processing,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc as tokio_mpsc, watch};
@@ -69,9 +70,14 @@ impl RuntimeController {
         let (audio_level_mode_tx, audio_level_mode_rx) = watch::channel(false);
 
         let trigger_hotkey = runtime.block_on(async {
-            let config = state.config.lock().await;
-            config.trigger_hotkey.clone()
-        });
+            let mut config = state.config.lock().await;
+            let normalized = normalize_hotkey_string(&config.trigger_hotkey)?;
+            if normalized != config.trigger_hotkey {
+                config.trigger_hotkey = normalized.clone();
+                config.save_to_disk()?;
+            }
+            Ok::<String, String>(normalized)
+        })?;
 
         runtime.spawn(run_command_loop(
             command_rx,

@@ -115,13 +115,8 @@ impl AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let trigger_hotkey = if cfg!(target_os = "macos") {
-            "Ctrl+Space".to_string()
-        } else {
-            "Meta+Ctrl+Space".to_string()
-        };
         Self {
-            trigger_hotkey,
+            trigger_hotkey: "Shift+Space".to_string(),
             selected_audio_device: None,
             use_gpu: true,
             auto_start: true,
@@ -162,12 +157,7 @@ mod tests {
 
     #[test]
     fn default_hold_to_talk_avoids_os_reserved_chords() {
-        let expected = if cfg!(target_os = "macos") {
-            "Ctrl+Space"
-        } else {
-            "Meta+Ctrl+Space"
-        };
-        assert_eq!(AppConfig::default().trigger_hotkey, expected);
+        assert_eq!(AppConfig::default().trigger_hotkey, "Shift+Space");
     }
 
     #[test]

@@ -38,7 +38,7 @@ impl ShortcutService {
         F: Fn(ShortcutEvent) + Send + 'static,
     {
         let manager = GlobalHotKeyManager::new().map_err(|error| error.to_string())?;
-        let trigger = HotKey::from_str(trigger).map_err(|error| error.to_string())?;
+        let trigger = parse_compatible_hotkey(trigger)?;
 
         manager
             .register(trigger)
@@ -88,7 +88,7 @@ impl ShortcutService {
     }
 
     pub fn update(&mut self, trigger: &str) -> Result<(), String> {
-        let next_trigger = HotKey::from_str(trigger).map_err(|error| error.to_string())?;
+        let next_trigger = parse_compatible_hotkey(trigger)?;
 
         self.manager
             .unregister(self.trigger)
@@ -107,6 +107,21 @@ impl ShortcutService {
     }
 }
 
+fn parse_compatible_hotkey(trigger: &str) -> Result<HotKey, String> {
+    let compatible = trigger
+        .split('+')
+        .map(|token| {
+            if token.trim().eq_ignore_ascii_case("meta") {
+                "Super"
+            } else {
+                token.trim()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    HotKey::from_str(&compatible).map_err(|error| error.to_string())
+}
+
 impl Drop for ShortcutService {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
@@ -114,5 +129,22 @@ impl Drop for ShortcutService {
             let _ = event_thread.join();
         }
         let _ = self.manager.unregister(self.trigger);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_meta_hotkeys_remain_runtime_compatible() {
+        let parsed = parse_compatible_hotkey("Meta+Ctrl+Space").expect("legacy hotkey");
+        let canonical = HotKey::from_str("Super+Ctrl+Space").expect("canonical hotkey");
+        assert_eq!(parsed, canonical);
+    }
+
+    #[test]
+    fn shift_space_is_a_valid_runtime_hotkey() {
+        parse_compatible_hotkey("Shift+Space").expect("default hotkey");
     }
 }

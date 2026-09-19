@@ -90,7 +90,7 @@ origin mic list
 origin mic status
 origin mic select <name>
 origin hotkey show
-origin hotkey set Ctrl+Space
+origin hotkey set Shift+Space
 origin config list
 origin autostart status
 origin start
@@ -110,9 +110,9 @@ Dictation is fully local and does not require an API key. The model catalog incl
 
 | Action | Default | Behavior |
 |---|---|---|
-| Dictation | `Meta+Ctrl+Space` on Windows/Linux development, `Ctrl+Space` on macOS | Hold to record; release to transcribe and deliver text |
+| Dictation | `Shift+Space` | Hold to record; release to transcribe and deliver text |
 
-Change it with `origin hotkey set <chord>` and restart/reload the resident runtime so the global registration is refreshed.
+Change it with `origin hotkey set <chord>`. If the resident runtime is running, the CLI restarts it automatically so the new global binding takes effect.
 
 The resident UI is intentionally minimal. There is no dashboard or settings window. A compact non-activating overlay reports only `Listening`, `Processing`, `Success`, and `Error`; it must never steal focus from the application receiving dictated text.
 
@@ -166,7 +166,7 @@ Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, c
 Version changes use the standard-library helper:
 
 ```bash
-python scripts/version.py bump 0.1.28
+python scripts/version.py bump 0.1.29
 python scripts/version.py sync
 ```
 

@@ -20,10 +20,10 @@ Run this checklist on a real macOS 13+ machine using the release `origin` manage
 
 ## Dictation shortcut
 
-1. Verify the default macOS dictation shortcut is `Ctrl+Space`.
-2. Hold `Ctrl+Space`, speak a short sentence, release, and confirm the sentence is delivered to the focused text field.
+1. Verify the default macOS dictation shortcut is `Shift+Space`.
+2. Hold `Shift+Space`, speak a short sentence, release, and confirm the sentence is delivered to the focused text field.
 3. Verify there is no second assistant/hands-free shortcut.
-4. Run `origin hotkey set <chord>`, restart/reload the resident runtime, and verify the new binding works.
+4. Run `origin hotkey set <chord>`, verify the CLI reports that the running resident was restarted, and verify the new binding works.
 5. Verify pressing the shortcut while microphone access is unavailable does not falsely show `Listening`.
 
 ## Overlay and focus behavior

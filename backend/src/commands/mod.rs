@@ -432,7 +432,7 @@ pub fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
             "ctrl" | "control" => Some("Ctrl"),
             "alt" | "option" => Some("Alt"),
             "shift" => Some("Shift"),
-            "win" | "windows" | "meta" | "super" | "cmd" | "command" => Some("Meta"),
+            "win" | "windows" | "meta" | "super" | "cmd" | "command" => Some("Super"),
             _ => None,
         };
         if let Some(modifier) = modifier {
@@ -457,8 +457,19 @@ pub fn normalize_hotkey_string(raw: &str) -> Result<String, String> {
     if modifiers.is_empty() {
         return Err("Hotkey must include at least one modifier key".to_string());
     }
+    if key == "Space"
+        && modifiers.len() == 2
+        && modifiers.iter().any(|modifier| modifier == "Super")
+        && modifiers.iter().any(|modifier| modifier == "Ctrl")
+    {
+        return Ok("Shift+Space".to_string());
+    }
     modifiers.push(key);
-    Ok(modifiers.join("+"))
+    let normalized = modifiers.join("+");
+    normalized
+        .parse::<global_hotkey::hotkey::HotKey>()
+        .map_err(|error| format!("Unsupported global hotkey '{normalized}': {error}"))?;
+    Ok(normalized)
 }
 
 pub async fn get_trigger_hotkey(state: State<'_, AppState>) -> Result<String, String> {
@@ -785,7 +796,23 @@ mod tests {
             normalize_hotkey_string(" control + shift + spacebar ").unwrap(),
             "Ctrl+Shift+Space"
         );
-        assert_eq!(normalize_hotkey_string("cmd+K").unwrap(), "Meta+K");
+        assert_eq!(normalize_hotkey_string("cmd+K").unwrap(), "Super+K");
+        assert_eq!(
+            normalize_hotkey_string("meta+ctrl+space").unwrap(),
+            "Shift+Space"
+        );
+        assert_eq!(
+            normalize_hotkey_string("ctrl+win+space").unwrap(),
+            "Shift+Space"
+        );
+        assert_eq!(
+            normalize_hotkey_string("win+shift+k").unwrap(),
+            "Super+Shift+K"
+        );
+        assert_eq!(
+            normalize_hotkey_string("Shift+Space").unwrap(),
+            "Shift+Space"
+        );
         assert!(normalize_hotkey_string("ctrl + win").is_err());
     }
 
