@@ -48,8 +48,8 @@ origin model download <id>
 origin model select <id>
 origin model remove <id>
 origin mic list
+origin mic status
 origin mic select <name>
-origin mic test
 origin hotkey show
 origin hotkey set <chord>
 origin config list

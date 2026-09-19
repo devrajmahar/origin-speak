@@ -41,7 +41,7 @@ Run this checklist on a real macOS 13+ machine using the release `origin` manage
 2. Download a small model, select it, restart the runtime, and confirm dictation works.
 3. Re-run model status/list and confirm an unchanged verified model does not cause a visibly long full-file verification pause.
 4. Interrupt a model download, retry it, and verify the safe partial download resumes when the server honors Range.
-5. Run `origin mic list`, `origin mic select <name>`, and `origin mic test`.
+5. Run `origin mic list`, `origin mic status`, and `origin mic select <name>`.
 6. Run `origin config list` and verify only current voice-to-text configuration is exposed.
 
 ## Resident lifecycle

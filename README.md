@@ -87,7 +87,8 @@ origin model list
 origin model download tiny.en
 origin model select tiny.en
 origin mic list
-origin mic test
+origin mic status
+origin mic select <name>
 origin hotkey show
 origin hotkey set Ctrl+Space
 origin config list
@@ -163,7 +164,7 @@ Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, c
 Version changes use the standard-library helper:
 
 ```bash
-python scripts/version.py bump 0.1.26
+python scripts/version.py bump 0.1.27
 python scripts/version.py sync
 ```
 

@@ -93,7 +93,6 @@ pub enum MicAction {
     List,
     Status,
     Select(String),
-    Test,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,7 +248,7 @@ fn is_program_name(value: &str) -> bool {
 }
 
 pub fn usage() -> &'static str {
-    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, select, download, or remove local models\n  mic          List, select, or test microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Check for or stage a verified update\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
+    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, select, download, or remove local models\n  mic          List, inspect, or select microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Check for or stage a verified update\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
 }
 
 pub fn uninstall_requires_confirmation(
@@ -393,10 +392,9 @@ fn parse_mic(args: &[String]) -> Result<MicAction, CliError> {
         [one] if one == "list" => Ok(MicAction::List),
         [one] if one == "status" => Ok(MicAction::Status),
         [op, name] if op == "select" => Ok(MicAction::Select(name.clone())),
-        [one] if one == "test" => Ok(MicAction::Test),
         _ => Err(error(
             "usage",
-            "usage: origin mic [list|status|select <name>|test]",
+            "usage: origin mic [list|status|select <name>]",
         )),
     }
 }
@@ -574,8 +572,8 @@ mod tests {
             Command::Model(ModelAction::Download("tiny.en".into()))
         );
         assert_eq!(
-            parse(["origin", "mic", "test"]).unwrap().command,
-            Command::Mic(MicAction::Test)
+            parse(["origin", "mic", "list"]).unwrap().command,
+            Command::Mic(MicAction::List)
         );
         assert_eq!(
             parse(["origin", "autostart", "enable"]).unwrap().command,
@@ -600,6 +598,13 @@ mod tests {
                 .command,
             Command::Hotkey(HotkeyAction::Set("Ctrl+Space".into()))
         );
+    }
+
+    #[test]
+    fn microphone_test_command_is_not_supported() {
+        let error = parse(["origin", "mic", "test"]).unwrap_err();
+        assert_eq!(error.code, "usage");
+        assert!(!error.message.contains("|test"));
     }
 
     #[test]

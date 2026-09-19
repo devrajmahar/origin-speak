@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "origin-speak-backend"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "arboard",
  "chrono",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "origin-speak-native"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "chrono",
  "embed-resource",

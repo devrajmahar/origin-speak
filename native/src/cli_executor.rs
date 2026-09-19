@@ -11,14 +11,12 @@ use crate::cli::{
 };
 use crate::system_capabilities::SystemCapabilities;
 use origin_speak_lib::{
-    AppConfig, AppState, State, add_dictionary_word, cancel_listening, delete_dictionary_word,
-    delete_local_model, download_local_model, get_audio_devices, get_audio_level, get_config,
-    get_dictionary_words, get_transcription_settings, get_trigger_hotkey, list_local_models,
-    set_audio_device, set_config, set_transcription_model, set_trigger_hotkey, start_listening,
-    update_dictionary_word,
+    AppConfig, AppState, State, add_dictionary_word, delete_dictionary_word, delete_local_model,
+    download_local_model, get_audio_devices, get_config, get_dictionary_words,
+    get_transcription_settings, get_trigger_hotkey, list_local_models, set_audio_device,
+    set_config, set_transcription_model, set_trigger_hotkey, update_dictionary_word,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct CoreCliExecutor {
     state: Arc<AppState>,
@@ -354,30 +352,6 @@ impl CoreCliExecutor {
                     format!("Selected microphone {name}"),
                 ))
             }
-            MicAction::Test => self.test_microphone().await,
-        }
-    }
-
-    pub async fn test_microphone_selection(
-        &self,
-        device: Option<&str>,
-    ) -> Result<CommandResult, String> {
-        let original = get_config(State::new(self.state.as_ref())).await?;
-        let mut temporary = original.clone();
-        temporary.selected_audio_device = device.map(ToOwned::to_owned);
-        set_config(State::new(self.state.as_ref()), temporary).await?;
-
-        let test_result = self.test_microphone().await;
-        let restore_result = set_config(State::new(self.state.as_ref()), original).await;
-        match (test_result, restore_result) {
-            (Ok(result), Ok(_)) => Ok(result),
-            (Err(test_error), Ok(_)) => Err(test_error),
-            (Ok(_), Err(restore_error)) => Err(format!(
-                "microphone test completed but restoring the previous selection failed: {restore_error}"
-            )),
-            (Err(test_error), Err(restore_error)) => Err(format!(
-                "{test_error}; restoring the previous microphone selection also failed: {restore_error}"
-            )),
         }
     }
 
@@ -482,30 +456,6 @@ impl CoreCliExecutor {
                 ))
             }
         }
-    }
-
-    async fn test_microphone(&self) -> Result<CommandResult, String> {
-        start_listening(State::new(self.state.as_ref())).await?;
-        let mut peak = 0.0_f32;
-        let sample_result = async {
-            for _ in 0..20 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                peak = peak.max(
-                    get_audio_level(State::new(self.state.as_ref()))
-                        .await
-                        .unwrap_or(0.0),
-                );
-            }
-            Ok::<(), String>(())
-        }
-        .await;
-        let cancel_result = cancel_listening(State::new(self.state.as_ref())).await;
-        sample_result?;
-        cancel_result?;
-        Ok(
-            CommandResult::success("microphone_test", "Microphone test complete")
-                .field("peak_level", format!("{peak:.3}")),
-        )
     }
 }
 

@@ -692,23 +692,6 @@ async fn guided_setup(mut options: cli::SetupOptions) -> Result<Option<cli::Setu
             .clone()
             .unwrap_or_else(|| "default".to_string()),
     );
-    if prompt_yes_no("Test this microphone now?", false)? {
-        match executor
-            .test_microphone_selection(selected_mic.as_deref())
-            .await
-        {
-            Ok(test) => {
-                let peak = test
-                    .fields
-                    .iter()
-                    .find(|(key, _)| key == "peak_level")
-                    .map(|(_, value)| value.as_str())
-                    .unwrap_or("unknown");
-                eprintln!("  Microphone peak level: {peak}");
-            }
-            Err(error) => eprintln!("  Microphone test failed: {error}"),
-        }
-    }
 
     let current_hotkey = get_trigger_hotkey(State::new(state.as_ref())).await?;
     eprintln!();
