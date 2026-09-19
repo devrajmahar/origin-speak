@@ -34,6 +34,13 @@ pub use transcription::{
     TranscriptionRuntimeStatus, TranscriptionService, TranscriptionSettings,
 };
 
+/// Keep native transcribe.cpp device-registration logs out of user-facing CLI
+/// output. The resident runtime does not call this and retains its normal
+/// diagnostics.
+pub fn disable_cli_transcription_logging() {
+    transcribe_cpp::disable_logging();
+}
+
 #[derive(Clone, Copy)]
 pub struct State<'a, T>(&'a T);
 

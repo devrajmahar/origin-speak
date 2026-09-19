@@ -9,6 +9,7 @@ mod macos_bundle;
 mod management;
 mod path_control;
 mod process_control;
+mod runtime_compute_status;
 mod system_capabilities;
 mod update_manager;
 
@@ -500,6 +501,7 @@ fn main() {
     if let Some(code) = run_internal_helper(&args) {
         std::process::exit(code);
     }
+    origin_speak_lib::disable_cli_transcription_logging();
 
     let requested_format = if args.iter().any(|arg| arg == "--json") {
         OutputFormat::Json
@@ -1134,7 +1136,17 @@ async fn model_command(action: ModelAction, format: OutputFormat) -> Result<Comm
     let executor = CoreCliExecutor::new();
     let state = executor.state();
     let restart = matches!(action, ModelAction::Select(_));
-    let result = with_model_download_progress(state, executor.model(&action), format).await?;
+    let status_requested = matches!(action, ModelAction::Status);
+    let mut result = with_model_download_progress(state, executor.model(&action), format).await?;
+    if status_requested {
+        let selected = result
+            .fields
+            .iter()
+            .find(|(key, _)| key == "selected")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        result = append_runtime_compute_status(result, &selected)?;
+    }
     restart_after_mutation(result, restart)
 }
 
@@ -1216,8 +1228,10 @@ async fn status() -> Result<CommandResult, String> {
     let state = executor.state();
     let config = get_config(State::new(state.as_ref())).await?;
     let transcription = get_transcription_settings(State::new(state.as_ref())).await?;
-    let runtime = process_control::runtime_status()
-        .map(runtime_state_label)
+    let runtime_state = process_control::runtime_status();
+    let runtime = runtime_state
+        .as_ref()
+        .map(|state| runtime_state_label(*state))
         .unwrap_or_else(|error| format!("unsupported: {error}"));
     let native_autostart = autostart_control::status(&layout.runtime_path)
         .map(autostart_label)
@@ -1226,33 +1240,101 @@ async fn status() -> Result<CommandResult, String> {
         .map(|status| status.on_path.to_string())
         .unwrap_or_else(|error| format!("unknown: {error}"));
 
-    Ok(with_previous_update_result(
-        CommandResult::success("status", "Origin Speak status")
-            .field("version", env!("CARGO_PKG_VERSION"))
-            .field("runtime", runtime)
-            .field(
-                "runtime_installed",
-                layout.runtime_path.is_file().to_string(),
-            )
-            .field(
-                "manager_installed",
-                layout.manager_path.is_file().to_string(),
-            )
-            .field("model", transcription.model)
-            .field(
-                "microphone",
-                config
-                    .selected_audio_device
-                    .unwrap_or_else(|| "system default".to_string()),
-            )
-            .field("autostart_preference", config.auto_start.to_string())
-            .field("autostart_native", native_autostart)
-            .field("manager_on_path", manager_path)
-            .field("data_root", layout.data_root.display().to_string())
-            .field("runtime_path", layout.runtime_path.display().to_string())
-            .field("manager_path", layout.manager_path.display().to_string()),
-        previous_update,
-    ))
+    let result = CommandResult::success("status", "Origin Speak status")
+        .field("version", env!("CARGO_PKG_VERSION"))
+        .field("runtime", runtime)
+        .field(
+            "runtime_installed",
+            layout.runtime_path.is_file().to_string(),
+        )
+        .field(
+            "manager_installed",
+            layout.manager_path.is_file().to_string(),
+        )
+        .field("model", transcription.model)
+        .field(
+            "gpu_preference",
+            if config.use_gpu {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        )
+        .field(
+            "microphone",
+            config
+                .selected_audio_device
+                .unwrap_or_else(|| "system default".to_string()),
+        )
+        .field("autostart_preference", config.auto_start.to_string())
+        .field("autostart_native", native_autostart)
+        .field("manager_on_path", manager_path)
+        .field("data_root", layout.data_root.display().to_string())
+        .field("runtime_path", layout.runtime_path.display().to_string())
+        .field("manager_path", layout.manager_path.display().to_string());
+    let selected_model = result
+        .fields
+        .iter()
+        .find(|(key, _)| key == "model")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let result = append_runtime_compute_status_with_state(result, &selected_model, runtime_state)?;
+    Ok(with_previous_update_result(result, previous_update))
+}
+
+fn append_runtime_compute_status(
+    result: CommandResult,
+    selected_model: &str,
+) -> Result<CommandResult, String> {
+    append_runtime_compute_status_with_state(
+        result,
+        selected_model,
+        process_control::runtime_status(),
+    )
+}
+
+fn append_runtime_compute_status_with_state(
+    mut result: CommandResult,
+    selected_model: &str,
+    runtime_state: Result<RuntimeState, String>,
+) -> Result<CommandResult, String> {
+    match runtime_state {
+        Ok(RuntimeState::Stopped) => {
+            result = result
+                .field("compute", "unavailable (runtime stopped)")
+                .field("compute_status", "runtime-stopped");
+        }
+        Ok(RuntimeState::Running) => match runtime_compute_status::read()? {
+            Some(status) if status.model == selected_model => {
+                result = result
+                    .field(
+                        "compute",
+                        status
+                            .compute
+                            .unwrap_or_else(|| "pending (model not loaded yet)".to_string()),
+                    )
+                    .field("compute_status", status.phase);
+                if let Some(accelerator) = status.accelerator {
+                    result = result.field("accelerator", accelerator);
+                }
+                if let Some(reason) = status.fallback_reason {
+                    result = result.field("compute_fallback", reason);
+                }
+            }
+            Some(_) | None => {
+                result = result
+                    .field("compute", "pending (model not loaded yet)")
+                    .field("compute_status", "pending");
+            }
+        },
+        Err(error) => {
+            result = result.field("compute", "unknown").field(
+                "compute_status",
+                format!("runtime status unavailable: {error}"),
+            );
+        }
+    }
+    Ok(result)
 }
 
 async fn doctor() -> Result<CommandResult, String> {

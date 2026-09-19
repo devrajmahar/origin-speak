@@ -98,13 +98,9 @@ pub(super) fn planned_backend(gpu_requested: bool) -> BackendSelection {
         };
     }
 
-    let gpu = transcribe_cpp::devices().into_iter().find(|device| {
-        matches!(device.device_type, DeviceType::Gpu | DeviceType::Igpu)
-            || matches!(
-                device.kind.as_str(),
-                "metal" | "vulkan" | "cuda" | "rocm" | "gpu"
-            )
-    });
+    let gpu = transcribe_cpp::devices()
+        .into_iter()
+        .find(|device| device_metadata_is_gpu(device.device_type, &device.kind));
     match gpu {
         Some(device) => BackendSelection {
             active: TranscriptionComputeBackend::Gpu,
@@ -124,16 +120,13 @@ pub(super) fn planned_backend(gpu_requested: bool) -> BackendSelection {
 
 fn loaded_backend(model: &Model, gpu_requested: bool) -> BackendSelection {
     let backend_name = model.backend();
-    let normalized = backend_name.to_ascii_lowercase();
-    let is_gpu = matches!(
-        normalized.as_str(),
-        "metal" | "vulkan" | "cuda" | "rocm" | "gpu"
-    ) || normalized.contains("gpu");
+    let device = model.device().ok();
+    let is_gpu = device
+        .as_ref()
+        .is_some_and(|device| device_metadata_is_gpu(device.device_type, &device.kind));
 
     if is_gpu {
-        let accelerator = model
-            .device()
-            .ok()
+        let accelerator = device
             .map(|device| device_label(&backend_name, &device.description, &device.name))
             .or_else(|| Some(backend_name.clone()));
         BackendSelection {
@@ -152,6 +145,14 @@ fn loaded_backend(model: &Model, gpu_requested: bool) -> BackendSelection {
             }),
         }
     }
+}
+
+fn device_metadata_is_gpu(device_type: DeviceType, kind: &str) -> bool {
+    matches!(device_type, DeviceType::Gpu | DeviceType::Igpu)
+        || matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "metal" | "vulkan" | "cuda" | "rocm" | "sycl" | "gpu"
+        )
 }
 
 fn device_label(backend: &str, description: &str, name: &str) -> String {
@@ -306,5 +307,14 @@ mod tests {
         assert!(!should_retry_on_cpu(&TranscribeError::Unsupported(
             "unsupported".into()
         )));
+    }
+
+    #[test]
+    fn backend_device_metadata_classifies_gpu_without_backend_name_guessing() {
+        assert!(device_metadata_is_gpu(DeviceType::Gpu, "vulkan"));
+        assert!(device_metadata_is_gpu(DeviceType::Igpu, "vulkan"));
+        assert!(device_metadata_is_gpu(DeviceType::Unknown, "metal"));
+        assert!(!device_metadata_is_gpu(DeviceType::Cpu, "cpu"));
+        assert!(!device_metadata_is_gpu(DeviceType::Accel, "accel"));
     }
 }

@@ -233,6 +233,10 @@ fn is_program_name(value: &str) -> bool {
         .unwrap_or(value)
         .to_ascii_lowercase();
     matches!(basename.as_str(), "origin" | "origin.exe")
+        || matches!(
+            basename.as_str(),
+            "origin-windows-x86_64.exe" | "origin-macos-universal"
+        )
         || (basename.starts_with("origin-speak-")
             && (basename.ends_with("-windows-x86_64.exe")
                 || basename.ends_with("-macos-universal")))
@@ -523,6 +527,20 @@ mod tests {
         .unwrap();
         assert_eq!(request.output, OutputFormat::Json);
         assert!(matches!(request.command, Command::Setup(_)));
+    }
+
+    #[test]
+    fn stable_release_manager_aliases_are_stripped() {
+        assert_eq!(
+            parse(["origin-windows-x86_64.exe", "status"])
+                .unwrap()
+                .command,
+            Command::Status
+        );
+        assert_eq!(
+            parse(["origin-macos-universal", "status"]).unwrap().command,
+            Command::Status
+        );
     }
 
     #[test]

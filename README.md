@@ -1,175 +1,174 @@
 # Origin Speak
 
-Open-source, fully native local voice-to-text for Windows and macOS.
+Local, open-source voice-to-text for Windows and macOS. Whisper and Canary-Qwen 2.5B run on your machine; no API key or cloud transcription service is required.
 
-Origin Speak is split into two native Rust programs:
-
-- `origin`: the console manager for setup, models, microphones, configuration, lifecycle, updates, and uninstall.
-- `origin-runtime`: the silent resident GPUI process that owns the global dictation hotkey, microphone capture, local transcription, text delivery, and compact status overlay.
-
-There is no Electron, React, Node.js, browser/WebView runtime, HTTP bridge, JSON-RPC bridge, cloud transcription service, or assistant/action layer in the product architecture.
-
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-blue) ![GPUI](https://img.shields.io/badge/GPUI-native-3e63dd) ![Rust](https://img.shields.io/badge/Rust-stable-red)
-
-## Features
-
-- One configurable hold-to-talk dictation hotkey
-- Local Whisper and Canary-Qwen 2.5B transcription with CPU, Vulkan (Windows), or Metal (macOS) execution
-- Verified local model downloads pinned to immutable revisions and SHA-256 digests
-- Recognition dictionary hints for names and specialized vocabulary on Whisper-backed models
-- Reliable focused-application text delivery with clipboard recovery when direct delivery fails
-- Silent resident runtime with compact `Listening`, `Processing`, `Success`, and `Error` overlay states
-- CLI-managed model, microphone, hotkey, autostart, update, runtime, and configuration workflows
-- Safe uninstall that removes app-owned models, config, databases, runtime state, and installed binaries by default; `--keep-data` is the explicit opt-out
-
-## Supported desktop releases
+## Install
 
 ### Windows
 
-- Windows 10/11 (64-bit)
-- Rust stable
-- Visual Studio Build Tools with the C++ workload
-- Vulkan SDK only when building the Vulkan Whisper backend
+Open PowerShell:
+
+```powershell
+$p = "$env:TEMP\origin.exe"
+irm https://github.com/devrajmahar/origin-speak/releases/latest/download/origin-windows-x86_64.exe -OutFile $p
+& $p setup
+```
+
+Open a new terminal after setup:
+
+```powershell
+origin status
+```
 
 ### macOS
 
-- macOS 13+
-- Rust stable
-- Xcode Command Line Tools
-- Microphone permission for capture
-- Accessibility permission for text injection into other applications
-
-Native Linux packaging is intentionally not shipped yet. The current GPUI overlay path cannot guarantee safe passive-overlay behavior across both Wayland and X11. Linux release support also needs a supported native install/autostart lifecycle.
-
-## Run from source
-
-Build the manager and resident runtime separately:
+Open Terminal:
 
 ```bash
-cargo build --manifest-path native/Cargo.toml --bin origin --bin origin-runtime
+d="$(mktemp -d)"
+p="$d/origin"
+curl -fL https://github.com/devrajmahar/origin-speak/releases/latest/download/origin-macos-universal -o "$p"
+chmod +x "$p"
+"$p" setup
+rm -rf "$d"
 ```
 
-For GPU-accelerated local Whisper:
+Then run `origin status`. Allow Microphone and Accessibility permissions when macOS asks.
 
-```bash
-# Windows (requires the Vulkan SDK)
-cargo build --manifest-path native/Cargo.toml --features gpu-vulkan --bin origin --bin origin-runtime
+## Use
 
-# macOS
-cargo build --manifest-path native/Cargo.toml --features gpu-metal --bin origin --bin origin-runtime
-```
+Default shortcut: **Shift + Space**.
 
-The plain build uses CPU transcription. `tiny.en` is the lowest-latency English model on CPU-constrained machines; `base.en` provides a larger default model when the machine has sufficient headroom.
+Hold the shortcut, speak, then release it. Origin Speak transcribes locally and types into the focused application.
 
-## CLI setup
+## Common commands
 
-Install from a terminal. There is no GUI installer.
+| What you want to change | Command |
+|---|---|
+| Show status | `origin status` |
+| Run diagnostics | `origin doctor` |
+| List models | `origin model list` |
+| Check selected model / GPU or CPU | `origin model status` |
+| Download a model | `origin model download <id>` |
+| Select a model | `origin model select <id>` |
+| Remove a model | `origin model remove <id>` |
+| List microphones | `origin mic list` |
+| Show microphone | `origin mic status` |
+| Select microphone | `origin mic select "<name>"` |
+| Use system-default microphone | `origin mic select default` |
+| Show shortcut | `origin hotkey show` |
+| Change shortcut | `origin hotkey set Ctrl+Shift+Space` |
+| Enable GPU preference | `origin config set use_gpu true` |
+| Force CPU | `origin config set use_gpu false` |
+| Enable autostart | `origin autostart enable` |
+| Disable autostart | `origin autostart disable` |
+| Start runtime | `origin start` |
+| Stop runtime | `origin stop` |
+| Restart runtime | `origin restart` |
+| Install latest update | `origin update` or `origin upgrade` |
+| Check for update only | `origin update check` |
+| Uninstall | `origin uninstall` |
 
-Windows PowerShell:
+A running resident automatically restarts when a changed model, microphone, hotkey, or relevant config value needs to take effect.
 
-```powershell
-irm https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.ps1 | iex
-```
+## Models
 
-macOS Terminal:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.sh | sh
-```
-
-The bootstrap command downloads the latest GitHub Release manager/runtime pair, verifies both SHA-256 digests against `bootstrap-update.json`, and runs `origin setup`. After installation, `origin` is the configuration surface. Typical commands are:
+Example:
 
 ```text
-origin setup
-origin status
-origin doctor
-origin model list
-origin model download tiny.en
-origin model select tiny.en
-origin mic list
-origin mic status
-origin mic select <name>
-origin hotkey show
-origin hotkey set Shift+Space
-origin config list
-origin autostart status
-origin start
-origin stop
-origin restart
+origin model download canary-qwen-2.5b
+origin model select canary-qwen-2.5b
+origin model status
+```
+
+Canary-Qwen 2.5B is English-only. Whisper models include English-only and multilingual variants.
+
+## Check whether transcription is actually using GPU or CPU
+
+Run:
+
+```text
+origin model status
+```
+
+GPU example:
+
+```text
+selected: canary-qwen-2.5b
+gpu_preference: enabled
+compute: GPU
+compute_status: ready
+accelerator: NVIDIA GeForce RTX 4080
+```
+
+CPU fallback example:
+
+```text
+compute: CPU
+compute_fallback: <reason>
+```
+
+`gpu_preference: enabled` only means Origin Speak should try the GPU. The `compute` field reports what the resident actually loaded.
+
+Right after startup, the model may not be loaded yet:
+
+```text
+compute: pending (model not loaded yet)
+```
+
+Run `origin model status` again after a few seconds or after the first dictation.
+
+## Change the shortcut
+
+Default:
+
+```text
+Shift+Space
+```
+
+Change it at any time:
+
+```text
+origin hotkey set Ctrl+Shift+Space
+```
+
+If the resident is running, Origin Speak restarts it automatically so the new binding becomes active.
+
+## Updates
+
+```text
 origin update
-origin update check
-origin upgrade
+```
+
+`origin upgrade` does the same thing. Downloads show transferred bytes, percentage, throughput, ETA, and a separate verification phase.
+
+## Uninstall
+
+Remove Origin Speak, installed models, and app-owned data:
+
+```text
 origin uninstall
 ```
 
-`origin setup` is idempotent: it keeps an already-valid model and matching configuration, downloads a model only when needed, installs the resident runtime, and can configure microphone/autostart choices. Human terminal sessions show live model/update download progress with transferred bytes, percentage, throughput, and ETA; `--json` stays machine-readable and emits no progress animation.
-
-Dictation is fully local and does not require an API key. The model catalog includes whisper.cpp models plus `canary-qwen-2.5b`, backed by the native transcribe.cpp Canary-Qwen runtime. Canary-Qwen is English-only; Origin Speak uses a pinned Q8_0 GGUF artifact with immutable revision, exact-size, structural, and SHA-256 verification. Models live under app-owned per-user Origin Speak model roots. Current installs prefer the local-data root; legacy ListenOS roots are discovered only for migration/cleanup compatibility. `origin uninstall` removes both current and recognized legacy model roots by default without deleting their parent data directories.
-
-## Default shortcut and overlay
-
-| Action | Default | Behavior |
-|---|---|---|
-| Dictation | `Shift+Space` | Hold to record; release to transcribe and deliver text |
-
-Change it with `origin hotkey set <chord>`. If the resident runtime is running, the CLI restarts it automatically so the new global binding takes effect.
-
-The resident UI is intentionally minimal. There is no dashboard or settings window. A compact non-activating overlay reports only `Listening`, `Processing`, `Success`, and `Error`; it must never steal focus from the application receiving dictated text.
-
-## Architecture
+Keep models/config intentionally:
 
 ```text
-origin CLI manager
-   | setup/config/models/mic/update/lifecycle/uninstall
-   v
-app-owned config + model/data roots
-
-origin-runtime
-   |
-   +-- global dictation hotkey
-   +-- CPAL microphone capture
-   +-- local Whisper inference
-   +-- focused-app text delivery
-   `-- compact GPUI status overlay
+origin uninstall --keep-data
 ```
 
-Repository layout:
+## Privacy and acceleration
 
-```text
-origin-speak/
-|-- native/
-|   |-- src/                 # CLI manager, resident runtime, platform lifecycle
-|   `-- packaging/           # Separate manager/runtime release artifact helpers
-|-- backend/                 # Reusable local dictation engine (rlib)
-|   `-- src/                 # audio, streaming, transcription, delivery, dictionary
-|-- scripts/                 # Release/version helpers
-`-- docs/
-```
+Origin Speak performs transcription locally. Supported execution paths are CPU, Vulkan on Windows, and Metal on macOS. Model downloads are pinned and verified before installation.
 
-The runtime calls the Rust core directly through typed in-process APIs. CPU/GPU-heavy inference, downloads, persistence, and other blocking work stay off the GPUI render thread.
+## Development
 
-See [`docs/gpui-native-architecture.md`](docs/gpui-native-architecture.md) and [`docs/cli-management.md`](docs/cli-management.md) for implementation details.
+Implementation and contributor documentation:
 
-## Build and validation
-
-```bash
-cargo fmt --manifest-path backend/Cargo.toml -- --check
-cargo test --manifest-path backend/Cargo.toml --locked
-cargo fmt --manifest-path native/Cargo.toml -- --check
-cargo check --manifest-path native/Cargo.toml --locked
-```
-
-## Releases
-
-Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, checksum files, and trust-status metadata on GitHub Releases at `devrajmahar/origin-speak`. Windows artifacts are signed and timestamped when the repository signing inputs are available, otherwise the release marks them unsigned. macOS artifacts use Developer ID signing and notarization when the full Apple credential set is available, otherwise the release publishes ad-hoc signed, non-notarized artifacts and says so in the release notes.
-
-Version changes use the standard-library helper:
-
-```bash
-python scripts/version.py bump 0.1.29
-python scripts/version.py sync
-```
+- [SETUP.md](SETUP.md)
+- [CLI management](docs/cli-management.md)
+- [Native architecture](docs/gpui-native-architecture.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 
-Origin Speak is open-source software released under the [MIT License](LICENSE). Third-party attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Origin Speak is released under the [MIT License](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

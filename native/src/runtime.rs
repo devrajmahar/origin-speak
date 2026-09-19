@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::runtime_compute_status;
 use origin_speak_lib::{
     AppState, DeliveryPhase, ShortcutEvent, ShortcutService, State, VoiceProcessingResult,
     get_audio_level, normalize_hotkey_string, process_captured_audio, start_listening,
@@ -100,6 +101,7 @@ impl RuntimeController {
             tokio::time::sleep(MODEL_PREWARM_DELAY).await;
             if transcription.runtime_status().model_downloaded {
                 let result = transcription.preload_selected_model().await;
+                let _ = runtime_compute_status::publish(&transcription.runtime_status());
                 #[cfg(debug_assertions)]
                 if let Err(error) = result {
                     eprintln!("[Origin Speak] model prewarm failed: {error}");
@@ -186,6 +188,9 @@ async fn run_command_loop(
                             let result =
                                 process_captured_audio(State::new(task_state.as_ref()), captured)
                                     .await;
+                            let _ = runtime_compute_status::publish(
+                                &task_state.transcription.runtime_status(),
+                            );
                             emit_processing_result(result, &task_events);
                         });
                     }

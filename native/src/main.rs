@@ -5,6 +5,7 @@ mod components;
 mod overlay;
 mod platform_shell;
 mod runtime;
+mod runtime_compute_status;
 mod state;
 mod theme;
 
@@ -26,6 +27,7 @@ fn main() {
     }
     platform_shell::start_instance_listener()
         .expect("failed to start Origin Speak resident control listener");
+    let _ = runtime_compute_status::clear();
     reconcile_persisted_auto_start();
 
     let runtime =
@@ -63,6 +65,7 @@ fn main() {
         platform_shell::mark_runtime_ready()
             .expect("failed to publish Origin Speak runtime readiness");
     });
+    let _ = runtime_compute_status::clear();
     platform_shell::cleanup_instance_control();
 }
 

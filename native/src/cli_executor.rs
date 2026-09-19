@@ -156,6 +156,7 @@ impl CoreCliExecutor {
                 let selected = get_transcription_settings(State::new(self.state.as_ref()))
                     .await?
                     .model;
+                let config = get_config(State::new(self.state.as_ref())).await?;
                 let models = list_local_models(State::new(self.state.as_ref())).await?;
                 let downloaded = models
                     .iter()
@@ -164,7 +165,15 @@ impl CoreCliExecutor {
                 Ok(
                     CommandResult::success("model_status", "Transcription model status")
                         .field("selected", selected)
-                        .field("downloaded", downloaded.to_string()),
+                        .field("downloaded", downloaded.to_string())
+                        .field(
+                            "gpu_preference",
+                            if config.use_gpu {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                        ),
                 )
             }
             ModelAction::Select(model) => {
