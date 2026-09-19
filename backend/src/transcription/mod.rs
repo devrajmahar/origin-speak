@@ -1,3 +1,4 @@
+mod canary_qwen;
 mod resampler;
 
 use futures_util::StreamExt;
@@ -15,13 +16,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, Once, OnceLock,
 };
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 pub const DEFAULT_MODEL: &str = "base.en";
 const GGML_MAGIC: [u8; 4] = *b"lmgg";
+const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const MIN_MODEL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -38,6 +40,12 @@ static VERIFIED_MODELS: OnceLock<Mutex<HashMap<PathBuf, VerifiedModelIdentity>>>
 static SHA256_FILE_CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
+enum ModelBackend {
+    Whisper,
+    CanaryQwen,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
     label: &'static str,
@@ -47,6 +55,8 @@ struct ModelSpec {
     tier: &'static str,
     english_only: bool,
     recommended: bool,
+    backend: ModelBackend,
+    expected_bytes: Option<u64>,
 }
 
 const MODELS: &[ModelSpec] = &[
@@ -59,6 +69,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "tiny",
         english_only: true,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "base.en",
@@ -69,6 +81,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "base",
         english_only: true,
         recommended: true,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "small.en",
@@ -79,6 +93,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "small",
         english_only: true,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "medium.en",
@@ -89,6 +105,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "medium",
         english_only: true,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "tiny",
@@ -99,6 +117,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "tiny",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "base",
@@ -109,6 +129,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "base",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "small",
@@ -119,6 +141,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "small",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "medium",
@@ -129,6 +153,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "medium",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "large-v3",
@@ -139,6 +165,8 @@ const MODELS: &[ModelSpec] = &[
         tier: "large-v3",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
     },
     ModelSpec {
         id: "large-v3-turbo",
@@ -149,6 +177,27 @@ const MODELS: &[ModelSpec] = &[
         tier: "large-v3-turbo",
         english_only: false,
         recommended: false,
+        backend: ModelBackend::Whisper,
+        expected_bytes: None,
+    },
+    ModelSpec {
+        // transcribe.cpp's native Canary-Qwen port bundles the FastConformer,
+        // Qwen3 tokenizer/decoder metadata, and merged LoRA weights in one GGUF.
+        // The Q8 artifact is pinned to the immutable conversion repo revision;
+        // the NVIDIA source checkpoint is nvidia/canary-qwen-2.5b
+        // (BF16 safetensors SHA-256
+        // 800cb0d099cf655a8887d8b741c3a4afa9891e2b2949870251c4d58c72b59175)
+        // and its Qwen3 tokenizer source is pinned at 70d244cc....
+        id: "canary-qwen-2.5b",
+        label: "Canary-Qwen 2.5B (Q8)",
+        filename: "canary-qwen-2.5b-Q8_0.gguf",
+        revision: "df576c1641eb59bb66bc3c396bbdd8b0b113825a",
+        sha256: "d89aad1285d5bd5aa441c464d3a4cf37bd5474f70705408e71558d8627415b34",
+        tier: "canary-qwen-2.5b",
+        english_only: true,
+        recommended: false,
+        backend: ModelBackend::CanaryQwen,
+        expected_bytes: Some(2_797_548_928),
     },
 ];
 
@@ -247,6 +296,7 @@ pub enum TranscriptionRuntimePhase {
     Ready,
     ModelMissing,
     Downloading,
+    Verifying,
     Loading,
     Transcribing,
     Error,
@@ -286,7 +336,12 @@ struct LoadedModel {
     id: String,
     gpu_requested: bool,
     backend: BackendSelection,
-    context: WhisperContext,
+    runtime: LoadedRuntime,
+}
+
+enum LoadedRuntime {
+    Whisper(WhisperContext),
+    CanaryQwen(canary_qwen::Runtime),
 }
 
 #[derive(Debug, Clone)]
@@ -449,15 +504,19 @@ impl TranscriptionService {
             .and_then(|download| download.as_ref().cloned())
             .is_some_and(|download| {
                 download.model == model
-                    && matches!(download.phase, TranscriptionRuntimePhase::Downloading)
+                    && matches!(
+                        download.phase,
+                        TranscriptionRuntimePhase::Downloading
+                            | TranscriptionRuntimePhase::Verifying
+                    )
             });
         let action = if downloading_selected {
-            "is still downloading"
+            "is still downloading or being verified"
         } else {
             "is not installed"
         };
         Err(format!(
-            "Local transcription model '{}' {action}. Run `origin model download {}` and `origin model use {}` before dictating.",
+            "Local transcription model '{}' {action}. Run `origin model download {}` and `origin model select {}` before dictating.",
             status.model, status.model, status.model
         ))
     }
@@ -502,7 +561,13 @@ impl TranscriptionService {
         let destination = dir.join(spec.filename);
         let selected = self.settings().model;
 
-        if find_valid_model_path(&spec)?.is_some() {
+        let installed_spec = spec;
+        let already_installed = tokio::task::spawn_blocking(move || {
+            find_valid_model_path(&installed_spec).map(|path| path.is_some())
+        })
+        .await
+        .map_err(|error| format!("Local model verification worker failed: {error}"))??;
+        if already_installed {
             self.set_download_runtime(None);
             return Ok(model_info(&spec, &selected));
         }
@@ -523,18 +588,34 @@ impl TranscriptionService {
 
         let download_runtime = self.download_runtime.clone();
         let model_id = spec.id;
-        let result = download_model_file(&spec, &destination, move |downloaded, total| {
-            if let Ok(mut runtime) = download_runtime.lock() {
-                let Some(status) = runtime.as_mut() else {
-                    return;
-                };
-                if status.model != model_id {
-                    return;
+        let verifying_runtime = download_runtime.clone();
+        let result = download_model_file(
+            &spec,
+            &destination,
+            move |downloaded, total| {
+                if let Ok(mut runtime) = download_runtime.lock() {
+                    let Some(status) = runtime.as_mut() else {
+                        return;
+                    };
+                    if status.model != model_id {
+                        return;
+                    }
+                    status.phase = TranscriptionRuntimePhase::Downloading;
+                    status.download_bytes = Some(downloaded);
+                    status.download_total_bytes = total;
                 }
-                status.download_bytes = Some(downloaded);
-                status.download_total_bytes = total;
-            }
-        })
+            },
+            move || {
+                if let Ok(mut runtime) = verifying_runtime.lock() {
+                    let Some(status) = runtime.as_mut() else {
+                        return;
+                    };
+                    if status.model == model_id {
+                        status.phase = TranscriptionRuntimePhase::Verifying;
+                    }
+                }
+            },
+        )
         .await;
         match result {
             Ok(()) => {
@@ -582,14 +663,14 @@ impl TranscriptionService {
         Ok(removed_any)
     }
 
-    /// Load the selected local Whisper model into memory without running inference.
+    /// Load the selected local transcription model into memory without running inference.
     /// This is safe to call repeatedly and is intentionally run off the UI thread so
     /// the first short dictation does not pay the full model-open cost after release.
     pub async fn preload_selected_model(&self) -> Result<(), String> {
         let model = self.settings().model;
         let spec = *model_spec(&model)
             .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
-        let path = find_valid_model_path(&spec)?.ok_or_else(|| {
+        let path = find_usable_model_path(&spec)?.ok_or_else(|| {
             format!("Local model '{model}' is not installed or is invalid. Download it before dictating.")
         })?;
 
@@ -640,13 +721,13 @@ impl TranscriptionService {
         samples: Vec<f32>,
         sample_rate: u32,
         language: Option<String>,
-        dictionary_hints: Vec<String>,
+        dictionary_hints: Vec<(String, Option<String>)>,
     ) -> Result<String, String> {
         let model = self.settings().model;
         validate_model_language(&model, language.as_deref())?;
         let spec = *model_spec(&model)
             .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
-        let path = find_valid_model_path(&spec)?.ok_or_else(|| {
+        let path = find_usable_model_path(&spec)?.ok_or_else(|| {
             format!("Local model '{model}' is not installed or is invalid. Download it before dictating.")
         })?;
 
@@ -687,57 +768,15 @@ impl TranscriptionService {
             let load_ms = load_started.elapsed().as_millis();
 
             let inference_started = Instant::now();
-            let initial_backend = guard
-                .as_ref()
-                .expect("loaded model was initialized")
-                .backend
-                .clone();
-            let initial_result = {
-                let loaded = guard.as_ref().expect("loaded model was initialized");
-                run_whisper_inference(
-                    &loaded.context,
-                    &audio,
-                    &model_for_task,
-                    language.as_deref(),
-                    &dictionary_hints,
-                )
-            };
-            let text = match initial_result {
-                Ok(text) => text,
-                Err(error) if should_retry_inference_on_cpu(&initial_backend, &error) => {
-                    let gpu_error = error
-                        .full_error()
-                        .expect("GPU inference fallback only handles full() failures")
-                        .to_string();
-                    log::warn!(
-                        "GPU Whisper inference failed for '{}': {}. Reloading on CPU and retrying once.",
-                        model_for_task,
-                        gpu_error
-                    );
-                    load_cpu_after_gpu_inference_failure(
-                        &mut guard,
-                        &model_for_task,
-                        &path,
-                        gpu_requested,
-                        &gpu_error,
-                    )?;
-                    let loaded = guard.as_ref().expect("CPU fallback model was initialized");
-                    run_whisper_inference(
-                        &loaded.context,
-                        &audio,
-                        &model_for_task,
-                        language.as_deref(),
-                        &dictionary_hints,
-                    )
-                    .map_err(|cpu_error| {
-                        format!(
-                            "GPU inference failed ({gpu_error}); CPU fallback retry failed: {}",
-                            cpu_error.into_message()
-                        )
-                    })?
-                }
-                Err(error) => return Err(error.into_message()),
-            };
+            let text = run_loaded_inference(
+                &mut guard,
+                &audio,
+                &model_for_task,
+                &path,
+                gpu_requested,
+                language.as_deref(),
+                &dictionary_hints,
+            )?;
             let inference_ms = inference_started.elapsed().as_millis();
             log::info!(
                 "Local transcription timing: model={}, audio_ms={}, resample_ms={}, model_load_ms={}, inference_ms={}, total_ms={}, text_chars={}",
@@ -820,7 +859,10 @@ impl TranscriptionService {
 }
 
 fn validate_model_language(model: &str, language: Option<&str>) -> Result<(), String> {
-    if !model.ends_with(".en") {
+    let Some(spec) = model_spec(model) else {
+        return Err(format!("Unknown local transcription model: {model}"));
+    };
+    if !spec.english_only {
         return Ok(());
     }
 
@@ -831,10 +873,18 @@ fn validate_model_language(model: &str, language: Option<&str>) -> Result<(), St
         return Ok(());
     }
 
-    let multilingual = model.trim_end_matches(".en");
-    Err(format!(
-        "Local model '{model}' is English-only and cannot transcribe source language '{language}'. Run `origin model download {multilingual}` and `origin model use {multilingual}`."
-    ))
+    let multilingual = model
+        .strip_suffix(".en")
+        .filter(|candidate| model_spec(candidate).is_some());
+    if let Some(multilingual) = multilingual {
+        Err(format!(
+            "Local model '{model}' is English-only and cannot transcribe source language '{language}'. Run `origin model download {multilingual}` and `origin model select {multilingual}`."
+        ))
+    } else {
+        Err(format!(
+            "Local model '{model}' is English-only and cannot transcribe source language '{language}'. Choose a multilingual model from `origin model list`."
+        ))
+    }
 }
 
 fn cpu_thread_count() -> i32 {
@@ -880,7 +930,7 @@ fn find_usable_model_path_in_roots(spec: &ModelSpec, roots: &[PathBuf]) -> Optio
     roots
         .iter()
         .map(|root| root.join(spec.filename))
-        .find(|path| validate_model_file(path, None).is_ok())
+        .find(|path| validate_model_file(path, spec, None).is_ok())
 }
 
 fn find_usable_model_path(spec: &ModelSpec) -> Result<Option<PathBuf>, String> {
@@ -1117,7 +1167,12 @@ fn status_for_model(
             None => (models_dir().ok().map(|dir| dir.join(spec.filename)), false),
         })
         .unwrap_or((None, false));
-    let planned_backend = select_backend(gpu_requested);
+    let planned_backend = model_spec(model)
+        .map(|spec| match spec.backend {
+            ModelBackend::Whisper => select_backend(gpu_requested),
+            ModelBackend::CanaryQwen => canary_qwen::planned_backend(gpu_requested),
+        })
+        .unwrap_or_else(|| select_backend(gpu_requested));
     let active_backend = loaded_backend.map(|backend| backend.active);
     let accelerator = loaded_backend
         .and_then(|backend| backend.accelerator.clone())
@@ -1149,16 +1204,26 @@ fn status_for_model(
 }
 
 fn model_url(spec: &ModelSpec) -> String {
-    format!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/{}/{}",
-        spec.revision, spec.filename
-    )
+    match spec.backend {
+        ModelBackend::Whisper => format!(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/{}/{}",
+            spec.revision, spec.filename
+        ),
+        ModelBackend::CanaryQwen => format!(
+            "https://huggingface.co/handy-computer/canary-qwen-2.5b-gguf/resolve/{}/{}",
+            spec.revision, spec.filename
+        ),
+    }
 }
 
 // Structural checks are intentionally separate from the catalog trust check.
 // Every supported artifact is pinned above to an immutable revision and a
 // verified SHA-256; both discovery and download installation require that hash.
-fn validate_model_file(path: &Path, expected_len: Option<u64>) -> Result<(), String> {
+fn validate_model_file(
+    path: &Path,
+    spec: &ModelSpec,
+    expected_len: Option<u64>,
+) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("could not stat model: {error}"))?;
     #[cfg(windows)]
@@ -1191,14 +1256,27 @@ fn validate_model_file(path: &Path, expected_len: Option<u64>) -> Result<(), Str
             return Err(format!("incomplete model: got {len} of {expected} bytes"));
         }
     }
+    if let Some(expected) = spec.expected_bytes {
+        if len != expected {
+            return Err(format!(
+                "model '{}' has unexpected size: got {len} bytes, expected {expected}",
+                spec.id
+            ));
+        }
+    }
 
     let mut magic = [0_u8; 4];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut magic))
         .map_err(|error| format!("could not read model header: {error}"))?;
-    if magic != GGML_MAGIC {
+    let expected_magic = match spec.backend {
+        ModelBackend::Whisper => GGML_MAGIC,
+        ModelBackend::CanaryQwen => GGUF_MAGIC,
+    };
+    if magic != expected_magic {
         return Err(format!(
-            "not a ggml model: expected magic {GGML_MAGIC:02x?}, got {magic:02x?}"
+            "invalid '{}' model header: expected magic {expected_magic:02x?}, got {magic:02x?}",
+            spec.id
         ));
     }
     Ok(())
@@ -1285,7 +1363,7 @@ fn validate_model_integrity(
     spec: &ModelSpec,
     expected_len: Option<u64>,
 ) -> Result<(), String> {
-    validate_model_file(path, expected_len)?;
+    validate_model_file(path, spec, expected_len)?;
     let before = verified_model_identity(path, spec)?;
     if verification_cache_matches(path, &before) {
         return Ok(());
@@ -1310,6 +1388,16 @@ fn validate_model_integrity(
         cache.insert(path.to_path_buf(), after);
     }
     Ok(())
+}
+
+async fn validate_model_integrity_off_thread(
+    path: PathBuf,
+    spec: ModelSpec,
+    expected_len: Option<u64>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || validate_model_integrity(&path, &spec, expected_len))
+        .await
+        .map_err(|error| format!("Model verification worker failed: {error}"))?
 }
 
 fn remove_model_leaf_no_follow(path: &Path) -> Result<bool, String> {
@@ -1358,17 +1446,23 @@ fn remove_model_leaf_no_follow(path: &Path) -> Result<bool, String> {
 fn remove_model_from_roots(spec: &ModelSpec, roots: &[PathBuf]) -> Result<bool, String> {
     let mut removed_any = false;
     for root in roots {
-        for path in [
-            root.join(spec.filename),
-            root.join(spec.filename).with_extension("bin.part"),
-        ] {
+        let model = root.join(spec.filename);
+        for path in [model.clone(), partial_model_path(&model)] {
             removed_any |= remove_model_leaf_no_follow(&path)?;
         }
     }
     Ok(removed_any)
 }
 
-fn partial_download_len(path: &Path) -> Result<u64, String> {
+fn partial_model_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    destination.with_file_name(format!("{name}.part"))
+}
+
+fn partial_download_len(path: &Path, spec: &ModelSpec) -> Result<u64, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1403,7 +1497,11 @@ fn partial_download_len(path: &Path) -> Result<u64, String> {
         std::fs::File::open(path)
             .and_then(|mut file| file.read_exact(&mut magic))
             .map_err(|error| format!("could not inspect partial model header: {error}"))?;
-        if magic != GGML_MAGIC {
+        let expected_magic = match spec.backend {
+            ModelBackend::Whisper => GGML_MAGIC,
+            ModelBackend::CanaryQwen => GGUF_MAGIC,
+        };
+        if magic != expected_magic {
             remove_model_leaf_no_follow(path)?;
             return Ok(0);
         }
@@ -1442,6 +1540,20 @@ fn parse_content_range_total(value: &str, expected_start: u64) -> Result<Option<
     if end >= total {
         return Err(format!("invalid Content-Range total: {value}"));
     }
+    validate_declared_model_size(total)?;
+    Ok(Some(total))
+}
+
+fn parse_unsatisfied_content_range_total(value: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let total = value
+        .trim()
+        .strip_prefix("bytes */")
+        .ok_or_else(|| format!("invalid unsatisfied Content-Range: {value}"))?
+        .parse::<u64>()
+        .map_err(|_| format!("invalid unsatisfied Content-Range: {value}"))?;
     validate_declared_model_size(total)?;
     Ok(Some(total))
 }
@@ -1489,6 +1601,21 @@ fn load_model(
     path: &Path,
     gpu_requested: bool,
 ) -> Result<(), String> {
+    let spec =
+        *model_spec(model).ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
+    validate_model_integrity(path, &spec, None)?;
+    if matches!(spec.backend, ModelBackend::CanaryQwen) {
+        let (runtime, backend) = canary_qwen::Runtime::load(path, gpu_requested)?;
+        log_loaded_backend(model, gpu_requested, &backend);
+        *loaded = Some(LoadedModel {
+            id: model.to_string(),
+            gpu_requested,
+            backend,
+            runtime: LoadedRuntime::CanaryQwen(runtime),
+        });
+        return Ok(());
+    }
+
     install_whisper_log_capture();
     reset_gpu_load_evidence();
     let planned_backend = select_backend(gpu_requested);
@@ -1534,7 +1661,7 @@ fn load_model(
                 id: model.to_string(),
                 gpu_requested,
                 backend,
-                context,
+                runtime: LoadedRuntime::Whisper(context),
             });
             return Ok(());
         }
@@ -1544,6 +1671,17 @@ fn load_model(
     };
     let backend =
         resolve_loaded_backend(gpu_requested, planned_backend, observed_gpu_load_evidence());
+    log_loaded_backend(model, gpu_requested, &backend);
+    *loaded = Some(LoadedModel {
+        id: model.to_string(),
+        gpu_requested,
+        backend,
+        runtime: LoadedRuntime::Whisper(context),
+    });
+    Ok(())
+}
+
+fn log_loaded_backend(model: &str, gpu_requested: bool, backend: &BackendSelection) {
     log::info!(
         "Local transcription backend loaded: model={}, gpu_requested={}, active={:?}, accelerator={}, fallback={}",
         model,
@@ -1561,13 +1699,106 @@ fn load_model(
         backend.accelerator.as_deref().unwrap_or("none"),
         backend.fallback_reason.as_deref().unwrap_or("none")
     );
-    *loaded = Some(LoadedModel {
-        id: model.to_string(),
-        gpu_requested,
-        backend,
-        context,
-    });
-    Ok(())
+}
+
+fn run_loaded_inference(
+    loaded: &mut Option<LoadedModel>,
+    audio: &[f32],
+    model: &str,
+    path: &Path,
+    gpu_requested: bool,
+    language: Option<&str>,
+    dictionary_hints: &[(String, Option<String>)],
+) -> Result<String, String> {
+    let initial_backend = loaded
+        .as_ref()
+        .ok_or_else(|| "Local transcription model was not loaded".to_string())?
+        .backend
+        .clone();
+    let is_canary = matches!(
+        loaded.as_ref().map(|loaded| &loaded.runtime),
+        Some(LoadedRuntime::CanaryQwen(_))
+    );
+
+    if is_canary {
+        let initial = match loaded.as_mut() {
+            Some(LoadedModel {
+                runtime: LoadedRuntime::CanaryQwen(runtime),
+                ..
+            }) => runtime.transcribe(audio, dictionary_hints),
+            _ => unreachable!("Canary runtime discriminator changed"),
+        };
+        return match initial {
+            Ok(text) => Ok(text),
+            Err(error)
+                if initial_backend.active == TranscriptionComputeBackend::Gpu
+                    && canary_qwen::should_retry_on_cpu(&error) =>
+            {
+                let error = error.to_string();
+                log::warn!(
+                    "GPU Canary-Qwen inference failed for '{}': {}. Reloading on CPU and retrying once.",
+                    model,
+                    error
+                );
+                load_canary_cpu_after_gpu_inference_failure(
+                    loaded,
+                    model,
+                    path,
+                    gpu_requested,
+                    &error,
+                )?;
+                match loaded.as_mut() {
+                    Some(LoadedModel {
+                        runtime: LoadedRuntime::CanaryQwen(runtime),
+                        ..
+                    }) => runtime.transcribe(audio, dictionary_hints).map_err(|cpu_error| {
+                        format!(
+                            "GPU Canary-Qwen inference failed ({error}); CPU fallback retry failed: {cpu_error}"
+                        )
+                    }),
+                    _ => Err("CPU Canary-Qwen fallback runtime was not loaded".to_string()),
+                }
+            }
+            Err(error) => Err(format!("Canary-Qwen inference failed: {error}")),
+        };
+    }
+
+    let initial_result = match loaded.as_ref() {
+        Some(LoadedModel {
+            runtime: LoadedRuntime::Whisper(context),
+            ..
+        }) => run_whisper_inference(context, audio, model, language, dictionary_hints),
+        _ => return Err("Whisper runtime was not loaded".to_string()),
+    };
+    match initial_result {
+        Ok(text) => Ok(text),
+        Err(error) if should_retry_inference_on_cpu(&initial_backend, &error) => {
+            let gpu_error = error
+                .full_error()
+                .expect("GPU inference fallback only handles full() failures")
+                .to_string();
+            log::warn!(
+                "GPU Whisper inference failed for '{}': {}. Reloading on CPU and retrying once.",
+                model,
+                gpu_error
+            );
+            load_cpu_after_gpu_inference_failure(loaded, model, path, gpu_requested, &gpu_error)?;
+            match loaded.as_ref() {
+                Some(LoadedModel {
+                    runtime: LoadedRuntime::Whisper(context),
+                    ..
+                }) => run_whisper_inference(context, audio, model, language, dictionary_hints)
+                    .map_err(|cpu_error| {
+                        format!(
+                            "GPU inference failed ({gpu_error}); CPU fallback retry failed: {}",
+                            cpu_error.into_message()
+                        )
+                    }),
+                _ => Err("CPU Whisper fallback runtime was not loaded".to_string()),
+            }
+        }
+        Err(error) => Err(error.into_message()),
+    }
 }
 
 fn run_whisper_inference(
@@ -1575,7 +1806,7 @@ fn run_whisper_inference(
     audio: &[f32],
     model: &str,
     language: Option<&str>,
-    dictionary_hints: &[String],
+    dictionary_hints: &[(String, Option<String>)],
 ) -> Result<String, WhisperInferenceError> {
     let mut state = context
         .create_state()
@@ -1599,20 +1830,14 @@ fn run_whisper_inference(
     params.set_no_context(true);
     params.set_single_segment(audio.len() < WHISPER_SAMPLE_RATE as usize * 30);
 
-    let selected_language = if model.ends_with(".en") {
+    let selected_language = if model_spec(model).is_some_and(|spec| spec.english_only) {
         Some("en")
     } else {
         language.filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("auto"))
     };
     params.set_language(selected_language);
 
-    let prompt = dictionary_hints
-        .iter()
-        .map(|hint| hint.trim())
-        .filter(|hint| !hint.is_empty())
-        .take(20)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let prompt = recognition_prompt(dictionary_hints);
     if !prompt.is_empty() {
         params.set_initial_prompt(&prompt);
     }
@@ -1630,6 +1855,28 @@ fn run_whisper_inference(
         );
     }
     Ok(text.trim().to_string())
+}
+
+fn recognition_prompt(hints: &[(String, Option<String>)]) -> String {
+    hints
+        .iter()
+        .filter_map(|(word, phonetic)| {
+            let word = word.trim();
+            if word.is_empty() {
+                return None;
+            }
+            let phonetic = phonetic
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            Some(match phonetic {
+                Some(phonetic) => format!("{word} (pronounced {phonetic})"),
+                None => word.to_string(),
+            })
+        })
+        .take(20)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn should_retry_inference_on_cpu(
@@ -1672,7 +1919,31 @@ fn load_cpu_after_gpu_inference_failure(
         id: model.to_string(),
         gpu_requested,
         backend: cpu_backend_after_gpu_inference_failure(gpu_error),
-        context,
+        runtime: LoadedRuntime::Whisper(context),
+    });
+    Ok(())
+}
+
+fn load_canary_cpu_after_gpu_inference_failure(
+    loaded: &mut Option<LoadedModel>,
+    model: &str,
+    path: &Path,
+    gpu_requested: bool,
+    gpu_error: &str,
+) -> Result<(), String> {
+    let (runtime, mut backend) = canary_qwen::Runtime::load(path, false).map_err(|cpu_error| {
+        format!(
+            "GPU Canary-Qwen inference failed ({gpu_error}); failed to load CPU fallback model ({cpu_error})"
+        )
+    })?;
+    backend.fallback_reason = Some(format!(
+        "GPU Canary-Qwen inference failed ({gpu_error}). Retried on CPU."
+    ));
+    *loaded = Some(LoadedModel {
+        id: model.to_string(),
+        gpu_requested,
+        backend,
+        runtime: LoadedRuntime::CanaryQwen(runtime),
     });
     Ok(())
 }
@@ -1695,25 +1966,27 @@ fn ensure_model_loaded(
     load_model(&mut guard, model, path, gpu_requested)
 }
 
-async fn download_model_file<F>(
+async fn download_model_file<F, V>(
     spec: &ModelSpec,
     destination: &Path,
     mut on_progress: F,
+    mut on_verify: V,
 ) -> Result<(), String>
 where
     F: FnMut(u64, Option<u64>),
+    V: FnMut(),
 {
     let url = model_url(spec);
-    let part = destination.with_extension("bin.part");
-    if validate_model_integrity(&part, spec, None).is_ok() {
-        remove_model_leaf_no_follow(destination)?;
-        return tokio::fs::rename(&part, destination)
-            .await
-            .map_err(|error| format!("Failed to install completed local model: {error}"));
-    }
-
-    let client = reqwest::Client::new();
-    let mut resume_offset = partial_download_len(&part)?;
+    let part = partial_model_path(destination);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .user_agent(format!(
+            "OriginSpeak/{} model-downloader",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .map_err(|error| format!("Failed to create model download client: {error}"))?;
+    let mut resume_offset = partial_download_len(&part, spec)?;
     let response = loop {
         let mut request = client.get(&url);
         if resume_offset > 0 {
@@ -1725,10 +1998,38 @@ where
             .map_err(|error| format!("Failed to download local model '{}': {error}", spec.id))?;
 
         if resume_offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-            // A stale/oversized partial cannot be resumed against this immutable
-            // artifact. Remove only the partial leaf and retry once from byte 0.
+            // A crash can leave a fully downloaded `.part` before the final
+            // verified rename. Only pay the full SHA-256 cost when the immutable
+            // origin says there are no bytes left to resume; ordinary partial
+            // retries should get back onto the network immediately.
+            let remote_total = parse_unsatisfied_content_range_total(
+                response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+            )?;
+            if remote_total.is_none_or(|remote_total| remote_total == resume_offset) {
+                on_verify();
+                if validate_model_integrity_off_thread(part.clone(), *spec, remote_total)
+                    .await
+                    .is_ok()
+                {
+                    remove_model_leaf_no_follow(destination)?;
+                    return tokio::fs::rename(&part, destination)
+                        .await
+                        .map_err(|error| {
+                            format!("Failed to install completed local model: {error}")
+                        });
+                }
+            }
+
+            // A stale/oversized/corrupt partial cannot be resumed against this
+            // immutable artifact. Remove only the partial leaf and retry once
+            // from byte 0. The next progress callback returns the runtime phase
+            // to Downloading after the temporary verification state above.
             remove_model_leaf_no_follow(&part)?;
             resume_offset = 0;
+            on_progress(0, None);
             continue;
         }
         break response;
@@ -1751,6 +2052,14 @@ where
         content_range,
         response.content_length(),
     )?;
+    if let (Some(expected), Some(actual)) = (spec.expected_bytes, expected_total) {
+        if actual != expected {
+            return Err(format!(
+                "Model download for '{}' declared {actual} bytes, expected {expected}",
+                spec.id
+            ));
+        }
+    }
 
     on_progress(start_offset, expected_total);
     let mut options = tokio::fs::OpenOptions::new();
@@ -1760,14 +2069,38 @@ where
     } else {
         options.create(true).truncate(true);
     }
-    let mut file = options
+    let file = options
         .open(&part)
         .await
         .map_err(|error| format!("Failed to open model download file: {error}"))?;
+    let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut stream = response.bytes_stream();
     let mut downloaded = start_offset;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("Model download interrupted: {error}"))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                // Keep the buffered tail useful for the next HTTP Range request.
+                // BufWriter normally retains up to 1 MiB in memory; explicitly
+                // flush and sync on interruption so reported progress and the
+                // persisted resume offset stay closely aligned.
+                let flush_error = file.flush().await.err();
+                let sync_error = if flush_error.is_none() {
+                    file.get_ref().sync_data().await.err()
+                } else {
+                    None
+                };
+                return Err(match (flush_error, sync_error) {
+                    (Some(flush_error), _) => format!(
+                        "Model download interrupted ({error}); preserving the buffered partial also failed: {flush_error}"
+                    ),
+                    (None, Some(sync_error)) => format!(
+                        "Model download interrupted ({error}); syncing the resumable partial also failed: {sync_error}"
+                    ),
+                    (None, None) => format!("Model download interrupted: {error}"),
+                });
+            }
+        };
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("Failed to write model download: {error}"))?;
@@ -1779,11 +2112,21 @@ where
                 "Model download exceeded the {MAX_MODEL_FILE_BYTES}-byte safety limit"
             ));
         }
+        if let Some(expected_total) = expected_total {
+            if downloaded > expected_total {
+                drop(file);
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(format!(
+                    "Model download exceeded its declared size of {expected_total} bytes"
+                ));
+            }
+        }
         on_progress(downloaded, expected_total);
     }
     file.flush()
         .await
         .map_err(|error| format!("Failed to flush model download: {error}"))?;
+    let file = file.into_inner();
     file.sync_all()
         .await
         .map_err(|error| format!("Failed to sync model download: {error}"))?;
@@ -1803,7 +2146,10 @@ where
         ));
     }
 
-    if let Err(error) = validate_model_integrity(&part, spec, expected_total) {
+    on_verify();
+    if let Err(error) =
+        validate_model_integrity_off_thread(part.clone(), *spec, expected_total).await
+    {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(format!(
             "Downloaded model '{}' is invalid: {error}",
@@ -1848,6 +2194,7 @@ mod tests {
 
     #[test]
     fn ggml_validation_rejects_truncated_and_non_model_files() {
+        let spec = model_spec("base.en").unwrap();
         let valid = temp_file("valid-model.bin");
         let mut file = std::fs::File::create(&valid).unwrap();
         use std::io::{Seek, SeekFrom, Write};
@@ -1856,15 +2203,59 @@ mod tests {
             .unwrap();
         file.write_all(&[0]).unwrap();
         drop(file);
-        validate_model_file(&valid, Some(MIN_MODEL_FILE_BYTES)).expect("valid model header");
-        assert!(validate_model_file(&valid, Some(MIN_MODEL_FILE_BYTES + 1)).is_err());
+        validate_model_file(&valid, spec, Some(MIN_MODEL_FILE_BYTES)).expect("valid model header");
+        assert!(validate_model_file(&valid, spec, Some(MIN_MODEL_FILE_BYTES + 1)).is_err());
 
         let html = temp_file("html-model.bin");
         std::fs::write(&html, b"<html>error</html>").unwrap();
-        assert!(validate_model_file(&html, None).is_err());
+        assert!(validate_model_file(&html, spec, None).is_err());
 
         let _ = std::fs::remove_file(valid);
         let _ = std::fs::remove_file(html);
+    }
+
+    #[test]
+    fn canary_qwen_catalog_pins_native_q8_gguf() {
+        let spec = model_spec("canary-qwen-2.5b").expect("Canary-Qwen catalog model");
+        assert_eq!(spec.filename, "canary-qwen-2.5b-Q8_0.gguf");
+        assert_eq!(spec.revision, "df576c1641eb59bb66bc3c396bbdd8b0b113825a");
+        assert_eq!(
+            spec.sha256,
+            "d89aad1285d5bd5aa441c464d3a4cf37bd5474f70705408e71558d8627415b34"
+        );
+        assert_eq!(spec.expected_bytes, Some(2_797_548_928));
+        assert!(spec.english_only);
+        assert!(matches!(spec.backend, ModelBackend::CanaryQwen));
+    }
+
+    #[test]
+    fn gguf_validation_uses_canary_magic_and_exact_catalog_size() {
+        let catalog = model_spec("canary-qwen-2.5b").unwrap();
+        let spec = ModelSpec {
+            expected_bytes: Some(MIN_MODEL_FILE_BYTES),
+            ..*catalog
+        };
+        let valid = temp_file("valid-canary.gguf");
+        let mut file = std::fs::File::create(&valid).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGUF_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        validate_model_file(&valid, &spec, None).expect("valid Canary GGUF header");
+
+        let wrong_magic = temp_file("wrong-canary.gguf");
+        let mut file = std::fs::File::create(&wrong_magic).unwrap();
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        assert!(validate_model_file(&wrong_magic, &spec, None).is_err());
+
+        let _ = std::fs::remove_file(valid);
+        let _ = std::fs::remove_file(wrong_magic);
     }
 
     #[test]
@@ -1928,6 +2319,11 @@ mod tests {
                 "large-v3-turbo",
                 "98aa99a",
                 "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+            ),
+            (
+                "canary-qwen-2.5b",
+                "df576c1641eb59bb66bc3c396bbdd8b0b113825a",
+                "d89aad1285d5bd5aa441c464d3a4cf37bd5474f70705408e71558d8627415b34",
             ),
         ];
         for (id, revision, sha256) in expected {
@@ -2014,6 +2410,15 @@ mod tests {
         assert!(url.ends_with("/ggml-base.en.bin"));
         assert!(url.contains("huggingface.co/ggerganov/whisper.cpp"));
         assert!(url.contains("/resolve/80da2d8/"));
+    }
+
+    #[test]
+    fn canary_model_url_is_immutable_and_points_to_native_q8_artifact() {
+        let spec = model_spec("canary-qwen-2.5b").unwrap();
+        assert_eq!(
+            model_url(spec),
+            "https://huggingface.co/handy-computer/canary-qwen-2.5b-gguf/resolve/df576c1641eb59bb66bc3c396bbdd8b0b113825a/canary-qwen-2.5b-Q8_0.gguf"
+        );
     }
 
     #[test]
@@ -2164,12 +2569,39 @@ mod tests {
     }
 
     #[test]
+    fn unsatisfied_range_total_distinguishes_complete_from_oversized_partial() {
+        let total = MIN_MODEL_FILE_BYTES * 3;
+        assert_eq!(
+            parse_unsatisfied_content_range_total(Some(&format!("bytes */{total}"))).unwrap(),
+            Some(total)
+        );
+        assert_eq!(parse_unsatisfied_content_range_total(None).unwrap(), None);
+        assert!(parse_unsatisfied_content_range_total(Some("bytes 0-1/2")).is_err());
+        assert!(parse_unsatisfied_content_range_total(Some("bytes */12")).is_err());
+    }
+
+    #[test]
     fn valid_partial_file_is_retained_for_resume() {
         let part = temp_file("resume.bin.part");
         std::fs::write(&part, [b'l', b'm', b'g', b'g', 1, 2, 3, 4]).unwrap();
-        assert_eq!(partial_download_len(&part).unwrap(), 8);
+        assert_eq!(
+            partial_download_len(&part, model_spec("base.en").unwrap()).unwrap(),
+            8
+        );
         assert!(part.exists());
         std::fs::remove_file(part).unwrap();
+    }
+
+    #[test]
+    fn partial_download_name_preserves_model_extension() {
+        assert_eq!(
+            partial_model_path(Path::new("canary-qwen-2.5b-Q8_0.gguf")),
+            PathBuf::from("canary-qwen-2.5b-Q8_0.gguf.part")
+        );
+        assert_eq!(
+            partial_model_path(Path::new("ggml-base.en.bin")),
+            PathBuf::from("ggml-base.en.bin.part")
+        );
     }
 
     #[test]
@@ -2183,7 +2615,27 @@ mod tests {
             .expect_err("English-only model must reject Hindi");
         assert!(error.contains("English-only"));
         assert!(error.contains("origin model download base"));
-        assert!(error.contains("origin model use base"));
+        assert!(error.contains("origin model select base"));
+
+        assert!(validate_model_language("canary-qwen-2.5b", Some("en")).is_ok());
+        let canary_error = validate_model_language("canary-qwen-2.5b", Some("hi"))
+            .expect_err("Canary-Qwen is English-only");
+        assert!(canary_error.contains("English-only"));
+        assert!(canary_error.contains("origin model list"));
+        assert!(!canary_error.contains("origin model select canary-qwen-2.5b"));
+    }
+
+    #[test]
+    fn whisper_recognition_prompt_preserves_optional_pronunciations() {
+        let hints = vec![
+            ("AxiusFlow".to_string(), Some("ax-ee-us flow".to_string())),
+            ("Rithmic".to_string(), None),
+            ("".to_string(), Some("ignored".to_string())),
+        ];
+        assert_eq!(
+            recognition_prompt(&hints),
+            "AxiusFlow (pronounced ax-ee-us flow), Rithmic"
+        );
     }
 
     #[test]

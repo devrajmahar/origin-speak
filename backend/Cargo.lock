@@ -1165,30 +1165,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
-name = "origin-speak-backend"
-version = "0.1.27"
-dependencies = [
- "arboard",
- "chrono",
- "cpal",
- "dirs-next",
- "enigo",
- "futures-util",
- "global-hotkey",
- "log",
- "reqwest",
- "rubato",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "uuid",
- "whisper-rs",
- "windows 0.56.0",
-]
-
-[[package]]
 name = "litemap"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1552,6 +1528,31 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "origin-speak-backend"
+version = "0.1.28"
+dependencies = [
+ "arboard",
+ "chrono",
+ "cpal",
+ "dirs-next",
+ "enigo",
+ "futures-util",
+ "global-hotkey",
+ "log",
+ "reqwest",
+ "rubato",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "transcribe-cpp",
+ "uuid",
+ "whisper-rs",
+ "windows 0.56.0",
 ]
 
 [[package]]
@@ -2261,6 +2262,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "transcribe-cpp"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b405c121ef674311b9e8eba83e45d859663da681952c7b95b730792ffde358e7"
+dependencies = [
+ "log",
+ "thiserror 2.0.17",
+ "transcribe-cpp-sys",
+]
+
+[[package]]
+name = "transcribe-cpp-sys"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00e81030804f0ce2dd83761ba18e90e0c0c0c2794d68ca008e24245ed6d2702e"
+dependencies = [
+ "cmake",
+ "serde_json",
 ]
 
 [[package]]

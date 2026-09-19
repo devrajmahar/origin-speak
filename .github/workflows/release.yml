@@ -325,6 +325,7 @@ jobs:
             --output dist/publish/bootstrap-update.json
           cp install.ps1 dist/publish/install.ps1
           cp install.sh dist/publish/install.sh
+          cp THIRD_PARTY_NOTICES.md dist/publish/THIRD_PARTY_NOTICES.md
 
       - name: Validate CLI/bootstrap update contract
         shell: bash
@@ -362,7 +363,7 @@ jobs:
           - Windows PowerShell: `irm https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.ps1 | iex`
           - macOS Terminal: `curl -fsSL https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.sh | sh`
 
-          Release assets include the origin CLI manager, the origin-runtime resident runtime, terminal bootstrap scripts, platform checksum files, and bootstrap-update.json.
+          Release assets include the origin CLI manager, the origin-runtime resident runtime, terminal bootstrap scripts, platform checksum files, bootstrap-update.json, and THIRD_PARTY_NOTICES.md.
 
           Trust status:
           - Windows: $WINDOWS_NOTE.

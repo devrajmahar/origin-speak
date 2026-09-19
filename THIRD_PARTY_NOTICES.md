@@ -134,6 +134,54 @@ the Unlicense.
 - Source: https://codeberg.org/tazz4843/whisper-rs
 - License: Unlicense
 
+## transcribe.cpp
+
+Origin Speak uses transcribe.cpp through the `transcribe-cpp` Rust bindings for
+local Canary-Qwen speech-to-text inference. The native library and its vendored
+ggml runtime are built into Origin Speak; no Python service or external
+inference process is used.
+
+- Project: transcribe.cpp
+- Source: https://github.com/handy-computer/transcribe.cpp
+- License: MIT
+
+Copyright (c) the transcribe.cpp contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## NVIDIA Canary-Qwen 2.5B model
+
+Origin Speak can download the Canary-Qwen 2.5B Q8_0 GGUF published by
+handy-computer. The GGUF is derived from NVIDIA's
+`nvidia/canary-qwen-2.5b` model. Origin Speak pins the converted artifact to an
+immutable repository revision and verifies its SHA-256 digest before use.
+
+- Original model: NVIDIA Canary-Qwen 2.5B
+- Source: https://huggingface.co/nvidia/canary-qwen-2.5b
+- Converted GGUF: https://huggingface.co/handy-computer/canary-qwen-2.5b-gguf
+- Model license: Creative Commons Attribution 4.0 International (CC BY 4.0)
+- License text: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Use of the model is subject to the upstream model license and attribution
+requirements. NVIDIA is the source of the original model; inclusion in Origin
+Speak does not imply NVIDIA endorsement.
+
 ## gpui-base
 
 Origin Speak uses `gpui-base` 0.6.x as the unstyled behavior and interaction foundation beneath Origin Speak-owned native UI components. Origin Speak does not use the `gpui-kit` / `gpui-component` styled component layer.

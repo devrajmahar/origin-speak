@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "origin-speak-backend"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "arboard",
  "chrono",
@@ -4600,6 +4600,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "transcribe-cpp",
  "uuid",
  "whisper-rs",
  "windows 0.56.0",
@@ -4607,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "origin-speak-native"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "chrono",
  "embed-resource",
@@ -6689,6 +6690,27 @@ dependencies = [
  "thread_local",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transcribe-cpp"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b405c121ef674311b9e8eba83e45d859663da681952c7b95b730792ffde358e7"
+dependencies = [
+ "log",
+ "thiserror 2.0.20",
+ "transcribe-cpp-sys",
+]
+
+[[package]]
+name = "transcribe-cpp-sys"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00e81030804f0ce2dd83761ba18e90e0c0c0c2794d68ca008e24245ed6d2702e"
+dependencies = [
+ "cmake",
+ "serde_json",
 ]
 
 [[package]]

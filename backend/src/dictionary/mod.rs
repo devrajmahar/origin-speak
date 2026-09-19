@@ -184,20 +184,55 @@ impl DictionaryStore {
         Ok(())
     }
 
-    /// Get all words for voice recognition context
-    pub fn get_words_for_recognition(&self) -> Result<Vec<String>, String> {
+    /// Get all words and optional pronunciations for voice recognition context.
+    pub fn get_words_for_recognition(&self) -> Result<Vec<(String, Option<String>)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         let mut stmt = conn
-            .prepare("SELECT word FROM words ORDER BY use_count DESC")
+            .prepare("SELECT word, phonetic FROM words ORDER BY use_count DESC")
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
         let words = stmt
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|e| format!("Failed to query words: {}", e))?;
 
         words
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect words: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_store() -> DictionaryStore {
+        let store = DictionaryStore {
+            conn: Mutex::new(Connection::open_in_memory().expect("in-memory dictionary")),
+        };
+        store.init_tables().expect("initialize dictionary schema");
+        store
+    }
+
+    #[test]
+    fn recognition_hints_preserve_optional_phonetics() {
+        let store = memory_store();
+        let entry = store
+            .add_word("AxiusFlow".to_string(), false)
+            .expect("add dictionary word");
+        store
+            .update_word(
+                &entry.id,
+                "AxiusFlow".to_string(),
+                Some("ax-ee-us flow".to_string()),
+            )
+            .expect("add pronunciation");
+
+        assert_eq!(
+            store
+                .get_words_for_recognition()
+                .expect("recognition hints"),
+            vec![("AxiusFlow".to_string(), Some("ax-ee-us flow".to_string()))]
+        );
     }
 }

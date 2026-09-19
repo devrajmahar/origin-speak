@@ -19,24 +19,365 @@ use cli::{
 };
 use cli_executor::CoreCliExecutor;
 use management::DataLayout;
+use origin_speak_lib::{AppState, TranscriptionRuntimePhase};
 use origin_speak_lib::{
     State, app_data_root, get_audio_devices, get_config, get_transcription_settings,
     get_trigger_hotkey, list_local_models, normalize_hotkey_string,
 };
 use process_control::RuntimeState;
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use system_capabilities::SystemCapabilities;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const HELPER_RETRY_TIMEOUT: Duration = Duration::from_secs(20);
+const UPDATE_RESULT_FILE: &str = "update-result.jsonl";
+const UPDATE_RESULT_MAX_BYTES: u64 = 256 * 1024;
 #[cfg(target_os = "windows")]
 const UNINSTALL_COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct UpdateResultRecord {
+    version: String,
+    status: String,
+    error: Option<String>,
+}
+
+struct TerminalProgress {
+    enabled: bool,
+    label: String,
+    started: Instant,
+    last_sample: Instant,
+    last_bytes: u64,
+    bytes_per_second: f64,
+    last_line_width: usize,
+    seen: bool,
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+impl TerminalProgress {
+    fn new(enabled: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            label: String::new(),
+            started: now,
+            last_sample: now,
+            last_bytes: 0,
+            bytes_per_second: 0.0,
+            last_line_width: 0,
+            seen: false,
+            downloaded: 0,
+            total: None,
+        }
+    }
+
+    fn update(&mut self, label: &str, downloaded: u64, total: Option<u64>) {
+        if !self.enabled {
+            return;
+        }
+        if self.seen && self.label != label {
+            self.finish_current();
+        }
+        if self.label != label {
+            let now = Instant::now();
+            self.label.clear();
+            self.label.push_str(label);
+            self.started = now;
+            self.last_sample = now;
+            self.last_bytes = downloaded;
+            self.bytes_per_second = 0.0;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_sample).as_secs_f64();
+        if elapsed >= 0.2 && downloaded >= self.last_bytes {
+            let instant = (downloaded - self.last_bytes) as f64 / elapsed;
+            self.bytes_per_second = if self.bytes_per_second == 0.0 {
+                instant
+            } else {
+                self.bytes_per_second * 0.7 + instant * 0.3
+            };
+            self.last_sample = now;
+            self.last_bytes = downloaded;
+        }
+        self.downloaded = downloaded;
+        self.total = total;
+        self.seen = true;
+
+        let line = progress_line(
+            &self.label,
+            downloaded,
+            total,
+            self.bytes_per_second,
+            self.started.elapsed(),
+        );
+        let padding = self.last_line_width.saturating_sub(line.chars().count());
+        eprint!("\r{line}{}", " ".repeat(padding));
+        let _ = io::stderr().flush();
+        self.last_line_width = line.chars().count();
+    }
+
+    fn finish_current(&mut self) {
+        if !self.enabled || !self.seen {
+            return;
+        }
+        let suffix = self
+            .total
+            .map(|total| format!("  {}", format_bytes(total)))
+            .unwrap_or_else(|| format!("  {}", format_bytes(self.downloaded)));
+        let line = format!("  ✓ {}{}", self.label, suffix);
+        let padding = self.last_line_width.saturating_sub(line.chars().count());
+        eprintln!("\r{line}{}", " ".repeat(padding));
+        let _ = io::stderr().flush();
+        self.last_line_width = 0;
+        self.seen = false;
+    }
+
+    fn abort(&mut self) {
+        if self.enabled && self.seen {
+            eprintln!();
+            let _ = io::stderr().flush();
+        }
+        self.last_line_width = 0;
+        self.seen = false;
+    }
+}
+
+fn progress_enabled(format: OutputFormat) -> bool {
+    matches!(format, OutputFormat::Human) && io::stderr().is_terminal()
+}
+
+fn progress_line(
+    label: &str,
+    downloaded: u64,
+    total: Option<u64>,
+    bytes_per_second: f64,
+    _elapsed: Duration,
+) -> String {
+    let speed = if bytes_per_second > 0.0 {
+        format!("{}/s", format_bytes(bytes_per_second as u64))
+    } else {
+        "--/s".to_string()
+    };
+    match total.filter(|total| *total > 0) {
+        Some(total) => {
+            const WIDTH: usize = 22;
+            let ratio = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
+            let filled = (ratio * WIDTH as f64).round() as usize;
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled));
+            let eta = if bytes_per_second > 0.0 && downloaded < total {
+                format!(
+                    "  ETA {}",
+                    format_eta(((total - downloaded) as f64 / bytes_per_second).ceil() as u64)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "  ↓ {label}  [{bar}] {:>3}%  {} / {}  {speed}{eta}",
+                (ratio * 100.0).floor() as u64,
+                format_bytes(downloaded),
+                format_bytes(total)
+            )
+        }
+        None => format!("  ↓ {label}  {}  {speed}", format_bytes(downloaded)),
+    }
+}
+
+fn format_eta(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+async fn with_model_download_progress<T, F>(
+    state: Arc<AppState>,
+    future: F,
+    format: OutputFormat,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    if !progress_enabled(format) {
+        return future.await;
+    }
+
+    tokio::pin!(future);
+    let mut progress = TerminalProgress::new(true);
+    let mut verifying_model: Option<String> = None;
+    let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                if let Some(model) = verifying_model.take() {
+                    match &result {
+                        Ok(_) => eprintln!("\r  ✓ Verified model {model}"),
+                        Err(_) => eprintln!(),
+                    }
+                }
+                match &result {
+                    Ok(_) => progress.finish_current(),
+                    Err(_) => progress.abort(),
+                }
+                return result;
+            }
+            _ = ticker.tick() => {
+                let status = state.transcription.runtime_status();
+                if matches!(status.phase, TranscriptionRuntimePhase::Downloading) {
+                    progress.update(
+                        &format!("Model {}", status.model),
+                        status.download_bytes.unwrap_or(0),
+                        status.download_total_bytes,
+                    );
+                    verifying_model = None;
+                } else if matches!(status.phase, TranscriptionRuntimePhase::Verifying)
+                    && verifying_model.as_deref() != Some(status.model.as_str())
+                {
+                    progress.finish_current();
+                    eprint!("  • Verifying model {} (SHA-256)...", status.model);
+                    let _ = io::stderr().flush();
+                    verifying_model = Some(status.model);
+                }
+            }
+        }
+    }
+}
+
+fn update_payload_label(path: &str) -> &'static str {
+    if path.contains("runtime") {
+        "Resident runtime"
+    } else {
+        "CLI manager"
+    }
+}
+
+fn append_update_result(layout: &DataLayout, record: &UpdateResultRecord) -> Result<(), String> {
+    append_update_result_at(&layout.data_root.join(UPDATE_RESULT_FILE), record)
+}
+
+fn append_update_result_at(path: &Path, record: &UpdateResultRecord) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "update result path has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "create update result directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing update result path that is not a regular file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > UPDATE_RESULT_MAX_BYTES {
+            return Err(format!(
+                "refusing oversized update result log: {}",
+                path.display()
+            ));
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("open update result log {}: {error}", path.display()))?;
+    let mut line =
+        serde_json::to_vec(record).map_err(|error| format!("serialize update result: {error}"))?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .map_err(|error| format!("write update result log: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync update result log: {error}"))
+}
+
+fn take_update_result(layout: &DataLayout) -> Result<Option<UpdateResultRecord>, String> {
+    take_update_result_at(&layout.data_root.join(UPDATE_RESULT_FILE))
+}
+
+fn take_update_result_at(path: &Path) -> Result<Option<UpdateResultRecord>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect update result log {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing update result path that is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > UPDATE_RESULT_MAX_BYTES {
+        return Err(format!(
+            "refusing oversized update result log: {}",
+            path.display()
+        ));
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("read update result log {}: {error}", path.display()))?;
+    let record = contents
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<UpdateResultRecord>(line).ok())
+        .ok_or_else(|| "update result log contained no valid record".to_string())?;
+    fs::remove_file(path)
+        .map_err(|error| format!("consume update result log {}: {error}", path.display()))?;
+    Ok(Some(record))
+}
+
+fn with_previous_update_result(
+    mut result: CommandResult,
+    previous: Option<UpdateResultRecord>,
+) -> CommandResult {
+    let Some(previous) = previous else {
+        return result;
+    };
+    result = result
+        .field("previous_update_version", previous.version)
+        .field("previous_update_status", previous.status);
+    if let Some(error) = previous.error {
+        result = result.field("previous_update_error", error);
+    }
+    result
+}
 
 #[cfg(target_os = "windows")]
 struct ArmedUninstallHelper {
@@ -212,33 +553,33 @@ async fn execute(command: Command, format: OutputFormat) -> Result<CommandResult
         Command::Setup(options) => {
             if setup_needs_guidance(&options, format) {
                 match guided_setup(options).await? {
-                    Some(options) => setup(options).await,
+                    Some(options) => setup(options, format).await,
                     None => Ok(CommandResult::success(
                         "setup_cancelled",
                         "Origin Speak setup cancelled; no changes were made",
                     )),
                 }
             } else {
-                setup(options).await
+                setup(options, format).await
             }
         }
         Command::Status => status().await,
         Command::Doctor => doctor().await,
         Command::Config(action) => config_command(action).await,
         Command::Dictionary(action) => CoreCliExecutor::new().dictionary(&action).await,
-        Command::Model(action) => model_command(action).await,
+        Command::Model(action) => model_command(action, format).await,
         Command::Mic(action) => mic_command(action).await,
         Command::Hotkey(action) => hotkey_command(action).await,
         Command::Autostart(action) => autostart(action).await,
         Command::Start => start(),
         Command::Stop => stop(),
         Command::Restart => restart(),
-        Command::Update(action) => update(action).await,
+        Command::Update(action) => update(action, format).await,
         Command::Uninstall(options) => uninstall(options, format),
     }
 }
 
-async fn setup(options: cli::SetupOptions) -> Result<CommandResult, String> {
+async fn setup(options: cli::SetupOptions, format: OutputFormat) -> Result<CommandResult, String> {
     let layout = DataLayout::discover()?;
     #[cfg(target_os = "macos")]
     {
@@ -258,7 +599,7 @@ async fn setup(options: cli::SetupOptions) -> Result<CommandResult, String> {
     if runtime_was_running {
         process_control::stop_runtime(COMMAND_TIMEOUT)?;
     }
-    setup_after_runtime_stop(&options, &layout, &current_exe, runtime_was_running).await
+    setup_after_runtime_stop(&options, &layout, &current_exe, runtime_was_running, format).await
 }
 
 async fn setup_after_runtime_stop(
@@ -266,6 +607,7 @@ async fn setup_after_runtime_stop(
     layout: &DataLayout,
     current_exe: &Path,
     runtime_was_running: bool,
+    format: OutputFormat,
 ) -> Result<CommandResult, String> {
     if options.interactive {
         eprintln!("Installing Origin Speak manager and resident runtime...");
@@ -339,7 +681,7 @@ async fn setup_after_runtime_stop(
                 )?);
                 runtime_installed = true;
             } else if !installed_macos_bundle_matches_manager(layout) {
-                let staged = stage_bootstrap_release_runtime(layout).await?;
+                let staged = stage_bootstrap_release_runtime(layout, format).await?;
                 release_staging = Some(staged.staging);
                 runtime_swap = Some(bootstrap::transactional_install_macos_runtime_bundle(
                     &staged.payload,
@@ -359,7 +701,7 @@ async fn setup_after_runtime_stop(
                 )?);
                 runtime_installed = true;
             } else if cfg!(target_os = "windows") || !layout.runtime_path.is_file() {
-                let staged = stage_bootstrap_release_runtime(layout).await?;
+                let staged = stage_bootstrap_release_runtime(layout, format).await?;
                 release_staging = Some(staged.staging);
                 runtime_swap = Some(bootstrap::transactional_replace(
                     &staged.payload,
@@ -381,7 +723,8 @@ async fn setup_after_runtime_stop(
         }
         let executor = CoreCliExecutor::new();
         let state = executor.state();
-        let mut result = executor.setup(options).await?;
+        let mut result =
+            with_model_download_progress(state.clone(), executor.setup(options), format).await?;
         let persisted = get_config(State::new(state.as_ref())).await?;
         desired_autostart = Some(persisted.auto_start);
 
@@ -787,10 +1130,11 @@ async fn config_command(action: ConfigAction) -> Result<CommandResult, String> {
     restart_after_mutation(result, mutating)
 }
 
-async fn model_command(action: ModelAction) -> Result<CommandResult, String> {
+async fn model_command(action: ModelAction, format: OutputFormat) -> Result<CommandResult, String> {
     let executor = CoreCliExecutor::new();
+    let state = executor.state();
     let restart = matches!(action, ModelAction::Select(_));
-    let result = executor.model(&action).await?;
+    let result = with_model_download_progress(state, executor.model(&action), format).await?;
     restart_after_mutation(result, restart)
 }
 
@@ -830,6 +1174,7 @@ struct StagedBootstrapRuntime {
 
 async fn stage_bootstrap_release_runtime(
     layout: &DataLayout,
+    format: OutputFormat,
 ) -> Result<StagedBootstrapRuntime, String> {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
@@ -837,8 +1182,22 @@ async fn stage_bootstrap_release_runtime(
             .map_err(|error| format!("invalid manager version: {error}"))?;
         let release = update_manager::fetch_release_for_version(&manager_version).await?;
         let staging = layout.update_staging_dir(env!("CARGO_PKG_VERSION"))?;
-        let payload = update_manager::stage_runtime_payload(&release, &staging).await?;
-        return Ok(StagedBootstrapRuntime { payload, staging });
+        let mut progress = TerminalProgress::new(progress_enabled(format));
+        let payload =
+            update_manager::stage_runtime_payload(&release, &staging, |path, downloaded, total| {
+                progress.update(update_payload_label(path), downloaded, total);
+            })
+            .await;
+        match payload {
+            Ok(payload) => {
+                progress.finish_current();
+                return Ok(StagedBootstrapRuntime { payload, staging });
+            }
+            Err(error) => {
+                progress.abort();
+                return Err(error);
+            }
+        }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -852,6 +1211,7 @@ async fn stage_bootstrap_release_runtime(
 
 async fn status() -> Result<CommandResult, String> {
     let layout = DataLayout::discover()?;
+    let previous_update = take_update_result(&layout)?;
     let executor = CoreCliExecutor::new();
     let state = executor.state();
     let config = get_config(State::new(state.as_ref())).await?;
@@ -866,30 +1226,33 @@ async fn status() -> Result<CommandResult, String> {
         .map(|status| status.on_path.to_string())
         .unwrap_or_else(|error| format!("unknown: {error}"));
 
-    Ok(CommandResult::success("status", "Origin Speak status")
-        .field("version", env!("CARGO_PKG_VERSION"))
-        .field("runtime", runtime)
-        .field(
-            "runtime_installed",
-            layout.runtime_path.is_file().to_string(),
-        )
-        .field(
-            "manager_installed",
-            layout.manager_path.is_file().to_string(),
-        )
-        .field("model", transcription.model)
-        .field(
-            "microphone",
-            config
-                .selected_audio_device
-                .unwrap_or_else(|| "system default".to_string()),
-        )
-        .field("autostart_preference", config.auto_start.to_string())
-        .field("autostart_native", native_autostart)
-        .field("manager_on_path", manager_path)
-        .field("data_root", layout.data_root.display().to_string())
-        .field("runtime_path", layout.runtime_path.display().to_string())
-        .field("manager_path", layout.manager_path.display().to_string()))
+    Ok(with_previous_update_result(
+        CommandResult::success("status", "Origin Speak status")
+            .field("version", env!("CARGO_PKG_VERSION"))
+            .field("runtime", runtime)
+            .field(
+                "runtime_installed",
+                layout.runtime_path.is_file().to_string(),
+            )
+            .field(
+                "manager_installed",
+                layout.manager_path.is_file().to_string(),
+            )
+            .field("model", transcription.model)
+            .field(
+                "microphone",
+                config
+                    .selected_audio_device
+                    .unwrap_or_else(|| "system default".to_string()),
+            )
+            .field("autostart_preference", config.auto_start.to_string())
+            .field("autostart_native", native_autostart)
+            .field("manager_on_path", manager_path)
+            .field("data_root", layout.data_root.display().to_string())
+            .field("runtime_path", layout.runtime_path.display().to_string())
+            .field("manager_path", layout.manager_path.display().to_string()),
+        previous_update,
+    ))
 }
 
 async fn doctor() -> Result<CommandResult, String> {
@@ -1041,33 +1404,47 @@ fn restart() -> Result<CommandResult, String> {
     ))
 }
 
-async fn update(action: UpdateAction) -> Result<CommandResult, String> {
+async fn update(action: UpdateAction, format: OutputFormat) -> Result<CommandResult, String> {
+    let layout = DataLayout::discover()?;
+    let previous_update = take_update_result(&layout)?;
     let Some(available) = update_manager::check_for_update(env!("CARGO_PKG_VERSION"), None).await?
     else {
-        return Ok(
+        return Ok(with_previous_update_result(
             CommandResult::success("up_to_date", "Origin Speak is up to date")
                 .field("version", env!("CARGO_PKG_VERSION")),
-        );
+            previous_update,
+        ));
     };
 
     if matches!(action, UpdateAction::Check) {
-        return Ok(CommandResult::success(
-            "update_available",
-            format!("Origin Speak {} is available", available.version),
-        )
-        .field("current_version", env!("CARGO_PKG_VERSION"))
-        .field("available_version", available.version.to_string()));
+        return Ok(with_previous_update_result(
+            CommandResult::success(
+                "update_available",
+                format!("Origin Speak {} is available", available.version),
+            )
+            .field("current_version", env!("CARGO_PKG_VERSION"))
+            .field("available_version", available.version.to_string()),
+            previous_update,
+        ));
     }
 
-    let layout = DataLayout::discover()?;
     let staging = layout.update_staging_dir(&available.version.to_string())?;
-    let staged = update_manager::stage_update(&available, &staging).await?;
-    let mut result = CommandResult::success(
-        "update_staged",
-        format!("Origin Speak {} update staged and verified", staged.version),
-    )
-    .field("manager_payload", staged.manager_path.display().to_string())
-    .field("runtime_payload", staged.runtime_path.display().to_string());
+    let mut progress = TerminalProgress::new(progress_enabled(format));
+    let staged = update_manager::stage_update(&available, &staging, |path, downloaded, total| {
+        progress.update(update_payload_label(path), downloaded, total);
+    })
+    .await;
+    let staged = match staged {
+        Ok(staged) => {
+            progress.finish_current();
+            staged
+        }
+        Err(error) => {
+            progress.abort();
+            return Err(error);
+        }
+    };
+    let result;
 
     #[cfg(target_os = "windows")]
     {
@@ -1076,6 +1453,14 @@ async fn update(action: UpdateAction) -> Result<CommandResult, String> {
             if runtime_was_running {
                 process_control::stop_runtime(COMMAND_TIMEOUT)?;
             }
+            append_update_result(
+                &layout,
+                &UpdateResultRecord {
+                    version: staged.version.to_string(),
+                    status: "pending".to_string(),
+                    error: None,
+                },
+            )?;
             let helper = match spawn_post_exit_helper(
                 "__post-exit-update",
                 &[
@@ -1089,6 +1474,16 @@ async fn update(action: UpdateAction) -> Result<CommandResult, String> {
             ) {
                 Ok(helper) => helper,
                 Err(error) => {
+                    let _ = append_update_result(
+                        &layout,
+                        &UpdateResultRecord {
+                            version: staged.version.to_string(),
+                            status: "failed".to_string(),
+                            error: Some(format!(
+                                "could not start post-exit update helper: {error}"
+                            )),
+                        },
+                    );
                     if runtime_was_running {
                         return match process_control::start_runtime(&layout.runtime_path) {
                             Ok(_) => Err(format!(
@@ -1102,7 +1497,15 @@ async fn update(action: UpdateAction) -> Result<CommandResult, String> {
                     return Err(error);
                 }
             };
-            result = result
+            result = CommandResult::success(
+                "update_scheduled",
+                format!(
+                    "Origin Speak {} downloaded and verified; installation will complete after this command exits",
+                    staged.version
+                ),
+            )
+                .field("manager_payload", staged.manager_path.display().to_string())
+                .field("runtime_payload", staged.runtime_path.display().to_string())
                 .field("post_exit_swap", "pending")
                 .field("helper", helper.display().to_string())
                 .field(
@@ -1114,7 +1517,17 @@ async fn update(action: UpdateAction) -> Result<CommandResult, String> {
                     },
                 );
         } else {
-            result = result.field("post_exit_swap", "not scheduled").field(
+            result = CommandResult::success(
+                "update_downloaded",
+                format!(
+                    "Origin Speak {} downloaded and verified; automatic replacement was not scheduled",
+                    staged.version
+                ),
+            )
+            .field("manager_payload", staged.manager_path.display().to_string())
+            .field("runtime_payload", staged.runtime_path.display().to_string())
+            .field("post_exit_swap", "not scheduled")
+            .field(
                 "reason",
                 "this manager is not running from the app-owned install path",
             );
@@ -1267,12 +1680,21 @@ async fn update(action: UpdateAction) -> Result<CommandResult, String> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        result = result.field(
+        result = CommandResult::success(
+            "update_ready",
+            format!(
+                "Origin Speak {} downloaded and verified; installing update",
+                staged.version
+            ),
+        )
+        .field("manager_payload", staged.manager_path.display().to_string())
+        .field("runtime_payload", staged.runtime_path.display().to_string())
+        .field(
             "post_exit_swap",
             "unsupported on this platform; verified payloads remain staged",
         );
     }
-    Ok(result)
+    Ok(with_previous_update_result(result, previous_update))
 }
 
 #[cfg(target_os = "macos")]
@@ -1618,14 +2040,57 @@ fn wait_for_uninstall_commit(path: &Path, timeout: Duration) -> Result<(), Strin
 
 #[cfg(target_os = "windows")]
 fn post_exit_update(args: &[OsString]) -> Result<(), String> {
-    let result = post_exit_update_inner(args);
+    let version = args
+        .first()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let apply = post_exit_update_inner(args);
     let cleanup = schedule_current_helper_delete();
-    match (result, cleanup) {
+    let record = match (&apply, &cleanup) {
+        (Ok(()), Ok(())) => UpdateResultRecord {
+            version,
+            status: "completed".to_string(),
+            error: None,
+        },
+        (Ok(()), Err(cleanup_error)) => UpdateResultRecord {
+            version,
+            status: "completed_with_warning".to_string(),
+            error: Some(format!(
+                "update installed, but scheduling helper cleanup failed: {cleanup_error}"
+            )),
+        },
+        (Err(error), Ok(())) => UpdateResultRecord {
+            version,
+            status: "failed".to_string(),
+            error: Some(error.clone()),
+        },
+        (Err(error), Err(cleanup_error)) => UpdateResultRecord {
+            version,
+            status: "failed".to_string(),
+            error: Some(format!(
+                "{error}; scheduling update-helper cleanup also failed: {cleanup_error}"
+            )),
+        },
+    };
+    let result = match (apply, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(format!(
             "{error}; scheduling update-helper cleanup also failed: {cleanup_error}"
+        )),
+    };
+    let record_result =
+        DataLayout::discover().and_then(|layout| append_update_result(&layout, &record));
+    match (result, record_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(record_error)) => Err(format!(
+            "update completed but recording its post-exit result failed: {record_error}"
+        )),
+        (Err(error), Err(record_error)) => Err(format!(
+            "{error}; recording the post-exit update result also failed: {record_error}"
         )),
     }
 }
@@ -2075,6 +2540,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_progress_reports_percentage_speed_and_eta() {
+        let line = progress_line(
+            "Model large-v3",
+            512 * 1024 * 1024,
+            Some(1024 * 1024 * 1024),
+            16.0 * 1024.0 * 1024.0,
+            Duration::from_secs(1),
+        );
+        assert!(line.contains("Model large-v3"));
+        assert!(line.contains("50%"));
+        assert!(line.contains("512.0 MiB / 1.00 GiB"));
+        assert!(line.contains("16.0 MiB/s"));
+        assert!(line.contains("ETA 32s"));
+    }
+
+    #[test]
+    fn terminal_progress_formats_long_eta_compactly() {
+        assert_eq!(format_eta(5), "5s");
+        assert_eq!(format_eta(65), "1m 05s");
+    }
+
+    #[test]
     fn setup_guidance_requires_human_tty_and_no_explicit_choices() {
         let options = cli::SetupOptions::default();
         assert!(setup_needs_guidance_with_terminal(
@@ -2145,6 +2632,69 @@ mod tests {
             assert_eq!(parse_update_runtime_state(&token).unwrap(), running);
         }
         assert!(parse_update_runtime_state(std::ffi::OsStr::new("unknown")).is_err());
+    }
+
+    #[test]
+    fn update_result_log_surfaces_latest_record_and_is_consumed() {
+        let root = std::env::temp_dir().join(format!(
+            "origin-speak-update-result-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(UPDATE_RESULT_FILE);
+        append_update_result_at(
+            &path,
+            &UpdateResultRecord {
+                version: "1.2.3".to_string(),
+                status: "pending".to_string(),
+                error: None,
+            },
+        )
+        .unwrap();
+        append_update_result_at(
+            &path,
+            &UpdateResultRecord {
+                version: "1.2.3".to_string(),
+                status: "failed".to_string(),
+                error: Some("replacement failed".to_string()),
+            },
+        )
+        .unwrap();
+
+        let record = take_update_result_at(&path).unwrap().unwrap();
+        assert_eq!(record.version, "1.2.3");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.error.as_deref(), Some("replacement failed"));
+        assert!(!path.exists());
+        assert!(take_update_result_at(&path).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_result_log_keeps_last_complete_record_if_tail_is_torn() {
+        let root = std::env::temp_dir().join(format!(
+            "origin-speak-update-result-torn-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(UPDATE_RESULT_FILE);
+        append_update_result_at(
+            &path,
+            &UpdateResultRecord {
+                version: "1.2.3".to_string(),
+                status: "pending".to_string(),
+                error: None,
+            },
+        )
+        .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"version\":\"1.2.3\"").unwrap();
+        file.sync_all().unwrap();
+
+        let record = take_update_result_at(&path).unwrap().unwrap();
+        assert_eq!(record.status, "pending");
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "windows")]

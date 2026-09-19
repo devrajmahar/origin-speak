@@ -111,7 +111,7 @@ pub enum ToggleAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateAction {
     Check,
-    Stage,
+    Apply,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,7 +248,7 @@ fn is_program_name(value: &str) -> bool {
 }
 
 pub fn usage() -> &'static str {
-    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, select, download, or remove local models\n  mic          List, inspect, or select microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Check for or stage a verified update\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
+    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, select, download, or remove local models\n  mic          List, inspect, or select microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Download, verify, and install the latest release\n  upgrade      Alias for 'origin update'\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
 }
 
 pub fn uninstall_requires_confirmation(
@@ -287,6 +287,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
         "stop" => expect_empty(tail, Command::Stop),
         "restart" => expect_empty(tail, Command::Restart),
         "update" => parse_update(tail).map(Command::Update),
+        "upgrade" => expect_empty(tail, Command::Update(UpdateAction::Apply)),
         "uninstall" => parse_uninstall(tail).map(Command::Uninstall),
         "version" | "--version" | "-V" => expect_empty(tail, Command::Version),
         other => Err(error(
@@ -423,10 +424,12 @@ fn parse_toggle(args: &[String]) -> Result<ToggleAction, CliError> {
 
 fn parse_update(args: &[String]) -> Result<UpdateAction, CliError> {
     match args {
-        [] => Ok(UpdateAction::Check),
+        [] => Ok(UpdateAction::Apply),
         [one] if one == "check" => Ok(UpdateAction::Check),
-        [one] if one == "stage" => Ok(UpdateAction::Stage),
-        _ => Err(error("usage", "usage: origin update [check|stage]")),
+        [one] if matches!(one.as_str(), "apply" | "install" | "upgrade" | "stage") => {
+            Ok(UpdateAction::Apply)
+        }
+        _ => Err(error("usage", "usage: origin update [check|apply]")),
     }
 }
 
@@ -582,6 +585,14 @@ mod tests {
         assert_eq!(
             parse(["origin", "update", "check"]).unwrap().command,
             Command::Update(UpdateAction::Check)
+        );
+        assert_eq!(
+            parse(["origin", "update"]).unwrap().command,
+            Command::Update(UpdateAction::Apply)
+        );
+        assert_eq!(
+            parse(["origin", "upgrade"]).unwrap().command,
+            Command::Update(UpdateAction::Apply)
         );
         assert_eq!(
             parse(["origin", "dictionary", "add", "Axius", "ACK-see-us"])

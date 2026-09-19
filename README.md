@@ -5,7 +5,7 @@ Open-source, fully native local voice-to-text for Windows and macOS.
 Origin Speak is split into two native Rust programs:
 
 - `origin`: the console manager for setup, models, microphones, configuration, lifecycle, updates, and uninstall.
-- `origin-runtime`: the silent resident GPUI process that owns the global dictation hotkey, microphone capture, local Whisper transcription, text delivery, and compact status overlay.
+- `origin-runtime`: the silent resident GPUI process that owns the global dictation hotkey, microphone capture, local transcription, text delivery, and compact status overlay.
 
 There is no Electron, React, Node.js, browser/WebView runtime, HTTP bridge, JSON-RPC bridge, cloud transcription service, or assistant/action layer in the product architecture.
 
@@ -14,9 +14,9 @@ There is no Electron, React, Node.js, browser/WebView runtime, HTTP bridge, JSON
 ## Features
 
 - One configurable hold-to-talk dictation hotkey
-- Local Whisper transcription with CPU, Vulkan (Windows), or Metal (macOS) execution
+- Local Whisper and Canary-Qwen 2.5B transcription with CPU, Vulkan (Windows), or Metal (macOS) execution
 - Verified local model downloads pinned to immutable revisions and SHA-256 digests
-- Recognition dictionary hints for names and specialized vocabulary
+- Recognition dictionary hints for names and specialized vocabulary on Whisper-backed models
 - Reliable focused-application text delivery with clipboard recovery when direct delivery fails
 - Silent resident runtime with compact `Listening`, `Processing`, `Success`, and `Error` overlay states
 - CLI-managed model, microphone, hotkey, autostart, update, runtime, and configuration workflows
@@ -96,13 +96,15 @@ origin autostart status
 origin start
 origin stop
 origin restart
+origin update
 origin update check
+origin upgrade
 origin uninstall
 ```
 
-`origin setup` is idempotent: it keeps an already-valid model and matching configuration, downloads a model only when needed, installs the resident runtime, and can configure microphone/autostart choices.
+`origin setup` is idempotent: it keeps an already-valid model and matching configuration, downloads a model only when needed, installs the resident runtime, and can configure microphone/autostart choices. Human terminal sessions show live model/update download progress with transferred bytes, percentage, throughput, and ETA; `--json` stays machine-readable and emits no progress animation.
 
-Dictation uses local Whisper and does not require an API key. Models live under app-owned per-user Origin Speak model roots. Current installs prefer the local-data root; legacy ListenOS roots are discovered only for migration/cleanup compatibility. `origin uninstall` removes both current and recognized legacy model roots by default without deleting their parent data directories.
+Dictation is fully local and does not require an API key. The model catalog includes whisper.cpp models plus `canary-qwen-2.5b`, backed by the native transcribe.cpp Canary-Qwen runtime. Canary-Qwen is English-only; Origin Speak uses a pinned Q8_0 GGUF artifact with immutable revision, exact-size, structural, and SHA-256 verification. Models live under app-owned per-user Origin Speak model roots. Current installs prefer the local-data root; legacy ListenOS roots are discovered only for migration/cleanup compatibility. `origin uninstall` removes both current and recognized legacy model roots by default without deleting their parent data directories.
 
 ## Default shortcut and overlay
 
@@ -164,7 +166,7 @@ Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, c
 Version changes use the standard-library helper:
 
 ```bash
-python scripts/version.py bump 0.1.27
+python scripts/version.py bump 0.1.28
 python scripts/version.py sync
 ```
 

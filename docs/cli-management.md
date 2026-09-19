@@ -39,21 +39,21 @@ The runtime must not grow assistant intent/action routing, conversations, confir
 
 ## Output contract
 
-`--json` is global and emits one plain JSON object with no ANSI control sequences, spinner frames, or interactive prompts. Human output is plain text. Destructive commands must not hang waiting for stdin in a non-interactive pipe/CI session.
+`--json` is global and emits one plain JSON object with no ANSI control sequences, spinner frames, or interactive prompts. Human terminal downloads use an in-place progress line with transferred bytes, percentage, throughput, and ETA. Destructive commands must not hang waiting for stdin in a non-interactive pipe/CI session.
 
 ## Setup and configuration
 
 `CoreCliExecutor` talks directly to `origin_speak_lib`. Setup is idempotent: existing valid models and matching selections are preserved; missing models are downloaded and verified; requested microphone/autostart values are applied only when needed.
 
-When `origin setup` is run directly in an interactive terminal with no explicit setup choices, it provides a plain-text guided flow. It shows detected CPU/RAM/accelerator status, the hardware-based model recommendation and model catalog, microphone choices with an optional non-final test, the dictation hotkey, and autostart preference. It shows a summary before persisting changes. `--json`, redirected input/output, and setup invocations with explicit choices remain deterministic and non-interactive.
+When `origin setup` is run directly in an interactive terminal with no explicit setup choices, it provides a guided terminal flow. It shows detected CPU/RAM/accelerator status, the hardware-based model recommendation and model catalog, microphone choices, the dictation hotkey, and autostart preference. It shows a summary before persisting changes. Missing model downloads then report live progress instead of leaving setup apparently idle. `--json`, redirected input/output, and setup invocations with explicit choices remain deterministic and non-interactive.
 
 The manager installs to the per-user manager path. On Windows setup adds only that exact directory to the per-user `PATH`, preserving unrelated entries and broadcasting the environment change; uninstall removes only the matching entry. Unix uses `~/.local/bin/origin` and reports whether that conventional directory is already on `PATH` without editing shell startup files.
 
 The persisted backend configuration is intentionally small and voice-to-text specific: dictation hotkey, selected microphone, GPU preference, autostart preference, and transcription source language. Old richer JSON configs remain readable because unknown legacy fields are ignored.
 
-`origin dictionary` manages only recognition hints used by Whisper prompting: list, add, update, and remove words with optional pronunciation text. It does not restore snippets, custom commands, or voice actions.
+`origin dictionary` manages only recognition hints used by Whisper prompting: list, add, update, and remove words with optional pronunciation text. The current Canary-Qwen native backend does not expose a prompt/hotword extension, so these hints are not applied when Canary-Qwen is selected. It does not restore snippets, custom commands, or voice actions.
 
-Model operations use the backend catalog, immutable upstream revisions, SHA-256 verification, resumable `.part` downloads, current/legacy model-root discovery, and safe per-model removal.
+Model operations use a backend-aware catalog, immutable upstream revisions, SHA-256 verification, resumable `.part` downloads, current/legacy model-root discovery, and safe per-model removal. Whisper models run through whisper.cpp; `canary-qwen-2.5b` runs in-process through transcribe.cpp using a pinned Q8_0 GGUF. Canary-Qwen is English-only and long dictation is segmented below its upstream 40-second training window before deterministic overlap de-duplication. A retry resumes from the persisted partial length without a full pre-resume hash pass; a completed partial is only promoted after exact SHA-256 verification. The final multi-gigabyte hash runs off the async executor so terminal `Verifying` feedback stays responsive.
 
 ## Hardware recommendation
 
@@ -79,9 +79,11 @@ macOS release output likewise keeps manager and resident runtime artifacts separ
 
 Self-replacement must happen after the running manager exits. The Windows implementation may use a narrowly scoped post-exit helper mode; it must not use shell deletion commands.
 
+`origin update` is the normal apply-now command: it checks the canonical GitHub Release manifest, downloads and SHA-256 verifies both manager and runtime payloads, then performs the platform-safe replacement while preserving prior runtime running/stopped state. `origin upgrade` is an alias. `origin update check` is the non-mutating availability check. The older `origin update stage` spelling remains accepted only as a compatibility alias for the apply flow. On Windows the running manager cannot replace itself, so a successful invocation reports `update_scheduled` once the post-exit helper is armed and a durable pending result is recorded. The helper appends its completed/failed result after the manager exits; the next `origin status` or update invocation surfaces that result and consumes the record instead of silently losing detached-helper failures.
+
 ## Uninstall
 
-Uninstall removes app-owned data by default, including downloaded Whisper models, config, databases/runtime state, installed runtime/manager targets, recognized legacy ListenOS model roots/update payloads, and stale Origin Speak update payloads. `--keep-data` is the explicit opt-out.
+Uninstall removes app-owned data by default, including downloaded transcription models, config, databases/runtime state, installed runtime/manager targets, recognized legacy ListenOS model roots/update payloads, and stale Origin Speak update payloads. `--keep-data` is the explicit opt-out.
 
 ### Migrating a pre-Origin-Speak macOS install
 

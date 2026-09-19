@@ -54,7 +54,7 @@ Run this checklist on a real macOS 13+ machine using the release `origin` manage
 
 ## Update bundle swap
 
-1. Install an older release, start the runtime, then run the supported `origin update stage` flow for a newer release.
+1. Install an older release, start the runtime, then run `origin update` (and separately verify the `origin upgrade` alias) for a newer release.
 2. Confirm the resident runtime is stopped before the live app bundle is replaced.
 3. Confirm the downloaded `origin-speak-runtime-<version>-macos-universal.zip` is SHA-256 verified before extraction.
 4. Confirm extraction uses the release app bundle as one top-level `Origin Speak.app`, and the installed bundle still passes `codesign --verify --deep --strict`.

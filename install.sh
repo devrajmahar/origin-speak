@@ -14,7 +14,11 @@ download_verified() {
   path="$2"
   expected="$3"
 
-  curl -fL --retry 3 --connect-timeout 15 "$url" -o "$path"
+  if [ -t 2 ]; then
+    curl -fL --retry 3 --connect-timeout 15 --progress-bar "$url" -o "$path"
+  else
+    curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$path"
+  fi
   actual="$(/usr/bin/shasum -a 256 "$path" | awk '{print $1}')"
   if [ "$actual" != "$expected" ]; then
     echo "SHA-256 verification failed for $(basename "$path")" >&2
@@ -27,7 +31,11 @@ if [ "$(uname -s)" != 'Darwin' ]; then
   exit 1
 fi
 
-echo 'Fetching latest Origin Speak release metadata...'
+echo
+echo '  Origin Speak'
+echo '  Local voice-to-text'
+echo
+echo '[1/3] Resolving latest release...'
 MANIFEST="$STAGING/bootstrap-update.json"
 curl -fsSL --retry 3 --connect-timeout 15 "$MANIFEST_URL" -o "$MANIFEST"
 
@@ -42,13 +50,17 @@ RUNTIME_SHA="$(/usr/bin/plutil -extract platforms.macos-universal.runtime.sha256
 MANAGER="$STAGING/$MANAGER_PATH"
 RUNTIME="$STAGING/$RUNTIME_PATH"
 
-echo "Downloading Origin Speak $VERSION CLI..."
+echo "[2/3] Downloading Origin Speak $VERSION..."
+echo '      CLI manager'
 download_verified "$MANAGER_URL" "$MANAGER" "$MANAGER_SHA"
+echo '      Resident runtime'
 download_verified "$RUNTIME_URL" "$RUNTIME" "$RUNTIME_SHA"
 chmod +x "$MANAGER"
 
-echo 'Checksums verified. Starting terminal setup...'
+echo '      Checksums verified'
+echo '[3/3] Running first-time setup...'
 "$MANAGER" setup
 
 echo
-echo 'Origin Speak is installed. Open a new terminal and run: origin status'
+echo '  Origin Speak is installed.'
+echo '  Open a new terminal and run: origin status'

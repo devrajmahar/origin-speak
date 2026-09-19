@@ -151,10 +151,14 @@ async fn fetch_manifest(manifest_url: Option<&str>) -> Result<BootstrapManifest,
     Ok(manifest)
 }
 
-pub async fn stage_update(
+pub async fn stage_update<F>(
     update: &AvailableUpdate,
     staging_dir: &Path,
-) -> Result<StagedUpdate, String> {
+    mut on_progress: F,
+) -> Result<StagedUpdate, String>
+where
+    F: FnMut(&str, u64, Option<u64>),
+{
     validate_available_update(update)?;
     prepare_staging_dir(staging_dir, &update.version).await?;
     let result = async {
@@ -163,8 +167,10 @@ pub async fn stage_update(
             .timeout(Duration::from_secs(60 * 30))
             .build()
             .map_err(|error| format!("create update client: {error}"))?;
-        let manager_path = download_payload(&client, &update.manager, staging_dir).await?;
-        let runtime_path = download_payload(&client, &update.runtime, staging_dir).await?;
+        let manager_path =
+            download_payload(&client, &update.manager, staging_dir, &mut on_progress).await?;
+        let runtime_path =
+            download_payload(&client, &update.runtime, staging_dir, &mut on_progress).await?;
         Ok(StagedUpdate {
             version: update.version.clone(),
             manager_path,
@@ -265,7 +271,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path)
         .map_err(|error| format!("open staged payload {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -303,10 +309,14 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-pub async fn stage_runtime_payload(
+pub async fn stage_runtime_payload<F>(
     release: &AvailableUpdate,
     staging_dir: &Path,
-) -> Result<PathBuf, String> {
+    mut on_progress: F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(&str, u64, Option<u64>),
+{
     validate_available_update(release)?;
     prepare_staging_dir(staging_dir, &release.version).await?;
     let result = async {
@@ -315,7 +325,7 @@ pub async fn stage_runtime_payload(
             .timeout(Duration::from_secs(60 * 30))
             .build()
             .map_err(|error| format!("create update client: {error}"))?;
-        download_payload(&client, &release.runtime, staging_dir).await
+        download_payload(&client, &release.runtime, staging_dir, &mut on_progress).await
     }
     .await;
     cleanup_staging_after_failure(result, staging_dir, &release.version).await
@@ -520,11 +530,15 @@ fn validate_payload(payload: &Payload, kind: &str, arch: &str) -> Result<(), Str
     validate_payload_shape(payload)
 }
 
-async fn download_payload(
+async fn download_payload<F>(
     client: &reqwest::Client,
     payload: &Payload,
     staging_dir: &Path,
-) -> Result<PathBuf, String> {
+    on_progress: &mut F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(&str, u64, Option<u64>),
+{
     validate_payload_shape(payload)?;
     let url = secure_url(&payload.url, "update payload")?;
     let response = client
@@ -536,10 +550,8 @@ async fn download_payload(
     let response = response
         .error_for_status()
         .map_err(|error| format!("download {}: {error}", payload.path))?;
-    if response
-        .content_length()
-        .is_some_and(|size| size > PAYLOAD_MAX_BYTES)
-    {
+    let expected_total = response.content_length();
+    if expected_total.is_some_and(|size| size > PAYLOAD_MAX_BYTES) {
         return Err(format!("{} exceeds the 1 GiB safety limit", payload.path));
     }
 
@@ -549,6 +561,7 @@ async fn download_payload(
     let mut stream = response.bytes_stream();
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
+    on_progress(&payload.path, 0, expected_total);
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
@@ -570,6 +583,7 @@ async fn download_payload(
             let _ = tokio::fs::remove_file(&partial).await;
             return Err(format!("write {}: {error}", partial.display()));
         }
+        on_progress(&payload.path, total, expected_total);
     }
     if let Err(error) = file.flush().await {
         drop(file);
@@ -843,6 +857,31 @@ mod tests {
         verify_regular_file_sha256(&installed, &expected, "installed runtime").unwrap();
         std::fs::write(&installed, b"changed runtime").unwrap();
         assert!(verify_regular_file_sha256(&installed, &expected, "installed runtime").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_payload_hashing_fits_on_a_small_thread_stack() {
+        let root = std::env::temp_dir().join(format!(
+            "origin-speak-update-small-stack-hash-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let payload = root.join("payload.bin");
+        std::fs::write(&payload, b"abc").unwrap();
+        let thread_payload = payload.clone();
+        let digest = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || sha256_file(&thread_payload))
+            .expect("spawn small-stack update hashing thread")
+            .join()
+            .expect("small-stack update hashing thread panicked")
+            .expect("hash update payload");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

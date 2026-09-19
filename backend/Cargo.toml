@@ -1,6 +1,6 @@
 [package]
 name = "origin-speak-backend"
-version = "0.1.27"
+version = "0.1.28"
 description = "Origin Speak - local voice-to-text dictation engine"
 authors = ["Origin Speak"]
 license = "PROPRIETARY"
@@ -11,8 +11,9 @@ default = []
 # VoxType's deployable Whisper strategy uses Vulkan as the cross-vendor
 # Windows GPU backend and Metal on macOS. These SDKs are build-time inputs;
 # shipped users only need a working graphics driver/runtime.
-gpu-vulkan = ["whisper-rs/vulkan"]
-gpu-metal = ["whisper-rs/metal"]
+gpu-vulkan = ["whisper-rs/vulkan", "transcribe-cpp/vulkan"]
+gpu-metal = ["whisper-rs/metal", "transcribe-cpp/metal"]
+canary-cuda = ["transcribe-cpp/cuda"]
 
 [lib]
 name = "origin_speak_lib"
@@ -32,6 +33,7 @@ rubato = "0.16"
 
 # Local speech-to-text
 whisper-rs = "0.16.0"
+transcribe-cpp = { version = "=0.2.3", default-features = false }
 
 # Async runtime primitives used by transcription/download/capture coordination
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
