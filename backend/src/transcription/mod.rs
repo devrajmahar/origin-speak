@@ -1215,7 +1215,11 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| format!("could not open model for hashing: {error}"))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // Keep the hashing buffer off the thread stack. Release LTO can inline this
+    // verifier into startup/model-discovery paths; a 1 MiB stack array is large
+    // enough to exhaust the default Windows main-thread stack before the CLI
+    // reaches its first prompt.
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -2034,6 +2038,25 @@ mod tests {
             .expect_err("wrong digest must not be trusted");
         assert!(error.contains("sha256 mismatch"));
         std::fs::remove_file(model).unwrap();
+    }
+
+    #[test]
+    fn sha256_helper_fits_on_a_small_thread_stack() {
+        let small = temp_file("sha256-small-stack");
+        std::fs::write(&small, b"abc").unwrap();
+        let thread_path = small.clone();
+        let digest = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || sha256_file(&thread_path))
+            .expect("spawn small-stack hashing thread")
+            .join()
+            .expect("small-stack hashing thread panicked")
+            .expect("hash small-stack vector");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_file(small).unwrap();
     }
 
     #[test]

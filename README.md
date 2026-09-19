@@ -163,7 +163,7 @@ Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, c
 Version changes use the standard-library helper:
 
 ```bash
-python scripts/version.py bump 0.1.25
+python scripts/version.py bump 0.1.26
 python scripts/version.py sync
 ```
 
