@@ -1,61 +1,90 @@
-# GPUI Native Architecture
+# GPUI Native Runtime Architecture
 
-ListenOS is a single-process Rust desktop application built with GPUI. ListenOS owns its visual component system; `gpui-base` provides unstyled interaction infrastructure beneath application-owned components.
+Origin Speak uses GPUI only for the resident runtime surface. The product has no general-purpose desktop dashboard or settings UI.
 
-## Runtime architecture
-
-```text
-global shortcuts / native windows / tray / updater
-                         |
-                         v
-                     GPUI app
-                         |
-                         v
-              ListenOS Rust application core
-              |       |        |       |
-            audio   whisper   state   delivery
-```
-
-The GPUI application links the voice engine as the `voice_os_lib` Rust library and invokes typed operations directly.
-
-## UI foundation
+The production split is:
 
 ```text
-ListenOS UI / components
-          |
-          v
-      gpui-base
-          |
-          v
-         GPUI
+origin                           origin-runtime
+CLI manager                     silent resident process
+-----------                     -----------------------
+setup/config                    one global dictation hotkey
+models/microphone               microphone capture
+hotkey/autostart                local Whisper inference
+start/stop/restart              focused-app text delivery
+update/uninstall                compact GPUI status overlay
 ```
 
-- ListenOS owns colors, spacing, radii, typography, motion, component composition, and visual states.
-- `gpui-base` supplies unstyled focus, input, selection, scrolling, dialogs, switches, and related interaction primitives where useful.
-- Listening, processing, success, and error feedback use one compact GPUI status box. It is non-activating and mouse-transparent so dictation never steals focus from the application underneath it.
-- Confirmation and hands-free controls use a separate compact non-activating surface only while pointer input is actually required.
-- Reusable text styles must define layout bounds, wrapping/truncation, and readable scaling behavior.
+The production architecture contains no Electron, React, Node.js, browser/WebView shell, HTTP bridge, or JSON-RPC bridge. Both binaries call the Rust core through typed in-process APIs.
+
+## Resident GPUI surface
+
+The runtime keeps a hidden GPUI/event-loop anchor as needed by the platform and global-hotkey integration. Its only visible UI is a compact, non-activating status overlay with four semantic states:
+
+- `Listening`: audio capture has actually started.
+- `Processing`: capture has ended and transcription/delivery is running.
+- `Success`: dictated text was delivered.
+- `Error`: capture, transcription, or delivery failed.
+
+The overlay must remain mouse-transparent/non-activating so it never steals focus from the target application. There are no confirmation controls, hands-free controls, dashboard pages, settings dialogs, or onboarding windows.
 
 ## Runtime rules
 
-- Audio capture, model inference, model downloads, persistence, and update I/O never block the GPUI render thread.
-- Global shortcut press transitions visible state before expensive capture or inference work begins.
-- Releasing hold-to-talk transitions through processing to success, error, or confirmation state based on the core result.
-- Audio-level animation schedules frames only while an animated overlay state is visible.
-- Settings mutations use typed core APIs and persist through the Rust configuration store.
-- Native shell responsibilities include tray/menu-bar lifecycle, autostart, single-instance activation, `listenos://` protocol activation, updater behavior, and platform permission integration.
+- Emit `Listening` only after CPAL successfully opens and starts the microphone stream.
+- Releasing the dictation hotkey snapshots capture quickly; Whisper inference and delivery continue away from the command/event loop.
+- Audio-level animation runs only while listening feedback is visible.
+- Model inference, model download, hashing, SQLite work, update I/O, and other blocking operations do not run on the GPUI render thread.
+- Model readiness must use cached verified identity on hot paths; unchanged multi-GB files must not be rehashed for every shortcut press or status query.
+- The runtime owns no assistant/action/conversation state.
+- Persistent configuration is changed by the `origin` manager and consumed by the runtime on launch/reload.
+
+## Core data flow
+
+```text
+global hotkey press
+      |
+      v
+CPAL capture  ---> compact Listening overlay
+      |
+hotkey release
+      |
+      v
+audio snapshot ---> Processing overlay
+      |
+      v
+local Whisper + recognition dictionary hints
+      |
+      v
+minimal trim/noise filtering
+      |
+      v
+focused-app text delivery
+      |
+      +---- success ----> Success overlay
+      `---- failure ----> Error overlay + clipboard/recovery buffer when available
+```
+
+## CLI/runtime ownership
+
+`origin` owns setup, model selection/download/removal, microphone selection/test, the dictation hotkey, autostart preference/integration, runtime lifecycle, diagnostics, updates, and uninstall.
+
+`origin-runtime` owns only resident dictation execution and its compact status feedback.
+
+Autostart must target `origin-runtime` directly. The manager must not be kept resident merely to host UI or settings.
 
 ## Release-readiness checks
 
-Before a public native release, verify these behaviors on the target operating systems:
+Before a public release, verify:
 
-- Windows global shortcuts work while another application owns focus.
-- The compact status overlay never steals focus; only the compact control surface accepts pointer input when confirmation or hands-free controls are visible.
-- Multiple monitors and mixed-DPI arrangements do not clip or offset overlay surfaces.
-- First-run model download and microphone setup complete in the native UI.
-- Settings survive process restart, including shortcut registration and shell settings where supported.
-- Local speech, command routing, delivery, dictionary, snippets, notes storage, and conversation tests remain green.
-- Windows installer signing and timestamp validation succeed before publication.
-- macOS native windowing, microphone permission, Accessibility automation, global shortcuts, tray/menu-bar behavior, deep-link activation, Developer ID signing, notarization, and package installation are validated on a macOS host.
+- The global dictation shortcut works while another application owns focus.
+- `Listening` is never shown before microphone capture has successfully started.
+- The overlay never steals focus and transitions cleanly through Listening/Processing/Success/Error.
+- Repeated dictation does not leave the runtime stuck in listening or processing state.
+- Model/config/microphone/hotkey operations work through `origin` without any UI dependency.
+- Existing verified model files are not repeatedly SHA-256 hashed on hot runtime/status paths.
+- Recognition dictionary hints affect Whisper spelling without introducing semantic command behavior.
+- Uninstall removes exact app-owned model/data roots by default and preserves them only with explicit `--keep-data`.
+- Windows release trust status is explicit: signed/timestamped when the configured signing inputs are complete, otherwise unsigned.
+- macOS release trust status is explicit: Developer ID signed/notarized when the configured Apple inputs are complete, otherwise ad-hoc signed and non-notarized. Microphone + Accessibility behavior still requires real-device validation.
 
-Native Linux packaging remains intentionally unsupported until a safe cross-backend overlay/input solution exists for both Wayland and X11.
+Native Linux packaging remains intentionally unsupported until the passive overlay behavior and native install/autostart lifecycle are safe across supported Wayland/X11 environments.

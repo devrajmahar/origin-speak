@@ -4,7 +4,6 @@
 //! Cross-platform support for Windows, macOS, and Linux.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     mpsc, Arc, Mutex,
@@ -12,55 +11,20 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AudioHealthPhase {
-    Idle,
-    Starting,
-    Healthy,
-    Recovering,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioRuntimeStatus {
-    pub phase: AudioHealthPhase,
-    pub device_name: Option<String>,
-    pub restart_count: u32,
-    pub last_error: Option<String>,
-    pub last_callback_age_ms: Option<u64>,
-}
-
 #[derive(Debug, Clone)]
 struct RuntimeMetrics {
-    phase: AudioHealthPhase,
-    device_name: Option<String>,
-    restart_count: u32,
-    last_error: Option<String>,
-    last_callback_ms: Option<u64>,
-    phase_changed_ms: u64,
     sample_rate_hz: u32,
 }
 
 impl Default for RuntimeMetrics {
     fn default() -> Self {
         Self {
-            phase: AudioHealthPhase::Idle,
-            device_name: None,
-            restart_count: 0,
-            last_error: None,
-            last_callback_ms: None,
-            phase_changed_ms: now_millis(),
             sample_rate_hz: SAMPLE_RATE,
         }
     }
 }
 
-/// Audio chunk for streaming (100ms of audio at 16kHz = 1600 samples)
-#[allow(dead_code)]
-pub const CHUNK_SIZE_MS: u32 = 100;
 pub const SAMPLE_RATE: u32 = 16000;
-#[allow(dead_code)]
-pub const CHUNK_SAMPLES: usize = (SAMPLE_RATE * CHUNK_SIZE_MS / 1000) as usize;
 
 /// Audio streaming state - thread-safe implementation
 pub struct AudioStreamer {
@@ -243,7 +207,6 @@ impl AudioStreamer {
         }
         self.live_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
-        self.update_runtime(AudioHealthPhase::Starting, None, None, false);
         self.is_recording.store(true, Ordering::SeqCst);
 
         let is_recording = self.is_recording.clone();
@@ -255,7 +218,7 @@ impl AudioStreamer {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
         let owner_thread = thread::Builder::new()
-            .name("listenos-audio-capture".to_string())
+            .name("origin-audio-capture".to_string())
             .spawn(move || {
                 let result = run_capture_owner(
                     preferred_device_name.as_deref(),
@@ -272,9 +235,7 @@ impl AudioStreamer {
             })
             .map_err(|error| {
                 self.is_recording.store(false, Ordering::SeqCst);
-                let message = format!("Failed to start audio capture owner thread: {error}");
-                self.update_runtime(AudioHealthPhase::Error, None, Some(message.clone()), false);
-                message
+                format!("Failed to start audio capture owner thread: {error}")
             })?;
 
         {
@@ -300,15 +261,14 @@ impl AudioStreamer {
             Ok(Err(error)) => {
                 self.is_recording.store(false, Ordering::SeqCst);
                 self.release_capture_owner();
-                self.update_runtime(AudioHealthPhase::Error, None, Some(error.clone()), false);
                 Err(error)
             }
             Err(error) => {
                 self.is_recording.store(false, Ordering::SeqCst);
                 self.release_capture_owner();
-                let message = format!("Audio capture owner exited during startup: {error}");
-                self.update_runtime(AudioHealthPhase::Error, None, Some(message.clone()), false);
-                Err(message)
+                Err(format!(
+                    "Audio capture owner exited during startup: {error}"
+                ))
             }
         }
     }
@@ -332,8 +292,6 @@ impl AudioStreamer {
             self.last_stream_release_ms
                 .store(now_millis(), Ordering::Release);
         }
-
-        self.update_runtime(AudioHealthPhase::Idle, None, None, false);
 
         log::info!("Audio streaming stopped");
         released_active_stream
@@ -362,11 +320,6 @@ impl AudioStreamer {
         grace.saturating_sub(Duration::from_millis(elapsed_ms))
     }
 
-    /// Check if currently streaming
-    pub fn is_streaming(&self) -> bool {
-        self.is_recording.load(Ordering::SeqCst)
-    }
-
     /// Get accumulated samples
     pub fn get_accumulated_samples(&self) -> Vec<f32> {
         self.accumulated_samples
@@ -389,94 +342,11 @@ impl AudioStreamer {
         f32::from_bits(self.live_level_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
     }
 
-    pub fn snapshot_runtime_status(&self) -> AudioRuntimeStatus {
-        let now = now_millis();
-        self.runtime
-            .lock()
-            .map(|runtime| AudioRuntimeStatus {
-                phase: runtime.phase.clone(),
-                device_name: runtime.device_name.clone(),
-                restart_count: runtime.restart_count,
-                last_error: runtime.last_error.clone(),
-                last_callback_age_ms: runtime
-                    .last_callback_ms
-                    .map(|timestamp| now.saturating_sub(timestamp)),
-            })
-            .unwrap_or(AudioRuntimeStatus {
-                phase: AudioHealthPhase::Error,
-                device_name: None,
-                restart_count: 0,
-                last_error: Some("Audio runtime state unavailable".to_string()),
-                last_callback_age_ms: None,
-            })
-    }
-
     pub fn current_sample_rate(&self) -> u32 {
         self.runtime
             .lock()
             .map(|runtime| runtime.sample_rate_hz)
             .unwrap_or(SAMPLE_RATE)
-    }
-
-    pub fn should_restart(&self, healthy_stall_after: Duration, startup_timeout: Duration) -> bool {
-        if !self.is_streaming() {
-            return false;
-        }
-
-        let now = now_millis();
-        self.runtime
-            .lock()
-            .map(|runtime| {
-                let callback_age = runtime.last_callback_ms.map(|ts| now.saturating_sub(ts));
-                let phase_age = now.saturating_sub(runtime.phase_changed_ms);
-                match runtime.phase {
-                    AudioHealthPhase::Healthy => callback_age
-                        .map(|age| age > healthy_stall_after.as_millis() as u64)
-                        .unwrap_or(phase_age > startup_timeout.as_millis() as u64),
-                    AudioHealthPhase::Starting | AudioHealthPhase::Recovering => {
-                        phase_age > startup_timeout.as_millis() as u64
-                    }
-                    AudioHealthPhase::Error => true,
-                    AudioHealthPhase::Idle => false,
-                }
-            })
-            .unwrap_or(false)
-    }
-
-    pub fn mark_recovering(&self, reason: impl Into<String>) {
-        self.update_runtime(
-            AudioHealthPhase::Recovering,
-            None,
-            Some(reason.into()),
-            true,
-        );
-    }
-
-    pub fn mark_error(&self, error: impl Into<String>) {
-        self.update_runtime(AudioHealthPhase::Error, None, Some(error.into()), false);
-    }
-
-    fn update_runtime(
-        &self,
-        phase: AudioHealthPhase,
-        device_name: Option<String>,
-        last_error: Option<String>,
-        increment_restart_count: bool,
-    ) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.phase = phase;
-            if let Some(device_name) = device_name {
-                runtime.device_name = Some(device_name);
-            }
-            runtime.last_error = last_error;
-            runtime.phase_changed_ms = now_millis();
-            if increment_restart_count {
-                runtime.restart_count = runtime.restart_count.saturating_add(1);
-            }
-            if matches!(runtime.phase, AudioHealthPhase::Idle) {
-                runtime.last_callback_ms = None;
-            }
-        }
     }
 }
 
@@ -508,10 +378,6 @@ fn run_capture_owner(
     log::info!("Default input config: {:?}", config);
 
     if let Ok(mut metrics) = runtime.lock() {
-        metrics.phase = AudioHealthPhase::Starting;
-        metrics.device_name = Some(device_name.clone());
-        metrics.last_error = None;
-        metrics.phase_changed_ms = now_millis();
         metrics.sample_rate_hz = sample_rate;
     }
 
@@ -520,8 +386,6 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
-            let callback_runtime = runtime.clone();
-            let error_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -531,10 +395,9 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
-                        callback_runtime.clone(),
                     );
                 },
-                move |error| record_stream_error(&error_runtime, error.to_string()),
+                move |error| record_stream_error(error.to_string()),
                 None,
             )
         }
@@ -542,8 +405,6 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
-            let callback_runtime = runtime.clone();
-            let error_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -557,10 +418,9 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
-                        callback_runtime.clone(),
                     );
                 },
-                move |error| record_stream_error(&error_runtime, error.to_string()),
+                move |error| record_stream_error(error.to_string()),
                 None,
             )
         }
@@ -568,8 +428,6 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
-            let callback_runtime = runtime.clone();
-            let error_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -583,10 +441,9 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
-                        callback_runtime.clone(),
                     );
                 },
-                move |error| record_stream_error(&error_runtime, error.to_string()),
+                move |error| record_stream_error(error.to_string()),
                 None,
             )
         }
@@ -611,13 +468,8 @@ fn run_capture_owner(
     Ok(())
 }
 
-fn record_stream_error(runtime: &Arc<Mutex<RuntimeMetrics>>, error: String) {
+fn record_stream_error(error: String) {
     log::error!("Audio stream error: {}", error);
-    if let Ok(mut runtime) = runtime.lock() {
-        runtime.phase = AudioHealthPhase::Error;
-        runtime.last_error = Some(error);
-        runtime.phase_changed_ms = now_millis();
-    }
 }
 
 impl Default for AudioStreamer {
@@ -632,7 +484,6 @@ fn process_input_data(
     is_recording: Arc<AtomicBool>,
     accumulated: Arc<Mutex<Vec<f32>>>,
     live_level: Arc<AtomicU32>,
-    runtime: Arc<Mutex<RuntimeMetrics>>,
 ) {
     if !is_recording.load(Ordering::SeqCst) {
         live_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
@@ -667,12 +518,6 @@ fn process_input_data(
         let previous = f32::from_bits(live_level.load(Ordering::Relaxed));
         let smoothed = (previous * 0.22 + raw_level * 0.78).clamp(0.0, 1.0);
         live_level.store(smoothed.to_bits(), Ordering::Relaxed);
-    }
-
-    if let Ok(mut metrics) = runtime.lock() {
-        metrics.phase = AudioHealthPhase::Healthy;
-        metrics.last_callback_ms = Some(now_millis());
-        metrics.last_error = None;
     }
 
     if let Ok(mut samples) = accumulated.lock() {
@@ -715,7 +560,6 @@ mod tests {
         let is_recording = Arc::new(AtomicBool::new(true));
         let accumulated = Arc::new(Mutex::new(Vec::new()));
         let live_level = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-        let runtime = Arc::new(Mutex::new(RuntimeMetrics::default()));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();
 
@@ -723,7 +567,6 @@ mod tests {
         let callback_recording = is_recording.clone();
         let callback_accumulated = accumulated.clone();
         let callback_level = live_level.clone();
-        let callback_runtime = runtime.clone();
         let callback = thread::spawn(move || {
             entered_tx.send(()).expect("signal callback entry");
             process_input_data(
@@ -732,7 +575,6 @@ mod tests {
                 callback_recording,
                 callback_accumulated,
                 callback_level,
-                callback_runtime,
             );
             completed_tx.send(()).expect("signal callback completion");
         });

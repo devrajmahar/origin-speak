@@ -1,20 +1,29 @@
 [package]
-name = "listenos-native"
-version = "0.1.21"
+name = "origin-speak-native"
+version = "0.1.22"
 edition = "2024"
 publish = false
+autobins = false
+
+[[bin]]
+name = "origin-runtime"
+path = "src/main.rs"
+
+[[bin]]
+name = "origin"
+path = "src/cli_main.rs"
 
 [features]
 default = []
-gpu-vulkan = ["voice_os_lib/gpu-vulkan"]
-gpu-metal = ["voice_os_lib/gpu-metal"]
+gpu-vulkan = ["origin_speak_lib/gpu-vulkan"]
+gpu-metal = ["origin_speak_lib/gpu-metal"]
 
 [dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.5" }
 gpui-base = "=0.6.1"
 gpui-platform = { package = "gpui-pre-platform", version = "=0.3.5" }
-tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
-voice_os_lib = { package = "listenos-backend", path = "../backend" }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+origin_speak_lib = { package = "origin-speak-backend", path = "../backend" }
 chrono = "0.4"
 futures-util = "0.3"
 reqwest = { version = "0.11", features = ["json", "stream"] }
@@ -36,4 +45,4 @@ raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

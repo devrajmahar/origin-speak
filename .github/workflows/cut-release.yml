@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Semver version to release (example: 0.1.21)"
+        description: "Semver version to release (example: 0.1.22)"
         required: true
         type: string
 
@@ -39,3 +39,6 @@ jobs:
           git tag "v${VERSION}"
           git push origin HEAD
           git push origin "v${VERSION}"
+
+      - name: Explain publication handoff
+        run: echo "Tag v${{ inputs.version }} triggers release.yml, which publishes the canonical GitHub Release assets."

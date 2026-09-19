@@ -140,10 +140,6 @@ impl DeliveryState {
         self.current.recovered_to_clipboard = recovered_to_clipboard;
         self.current.updated_at = Utc::now();
     }
-
-    pub fn last_failed_text(&self) -> Option<String> {
-        self.last_failed_text.clone()
-    }
 }
 
 impl Default for DeliveryState {

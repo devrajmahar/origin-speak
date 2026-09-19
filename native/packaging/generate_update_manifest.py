@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the exact ListenOS native updater manifest from packaged artifacts."""
+"""Generate the Origin Speak CLI/bootstrap update manifest from release artifacts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def sha256(path: Path) -> str:
@@ -67,27 +67,47 @@ def main() -> None:
         raise SystemExit("version must not be empty")
 
     root = args.artifact_root
-    windows = require_one(root, f"ListenOS-{version}-Setup-x86_64.exe")
-    macos = require_one(root, f"ListenOS-{version}-macos-universal.dmg")
+    win_manager = require_one(root, f"origin-speak-{version}-windows-x86_64.exe")
+    win_runtime = require_one(root, f"origin-speak-runtime-{version}-windows-x86_64.exe")
+    mac_manager = require_one(root, f"origin-speak-{version}-macos-universal")
+    mac_runtime = require_one(root, f"origin-speak-runtime-{version}-macos-universal.zip")
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "version": version,
-        "artifacts": {
-            "windows": artifact_record(
-                windows,
-                kind="nsis-installer",
-                arch="x86_64",
-                public_base_url=args.public_base_url,
-                release_prefix=args.release_prefix,
-            ),
-            "macos": artifact_record(
-                macos,
-                kind="dmg-installer",
-                arch="universal",
-                public_base_url=args.public_base_url,
-                release_prefix=args.release_prefix,
-            ),
+        "platforms": {
+            "windows-x86_64": {
+                "manager": artifact_record(
+                    win_manager,
+                    kind="cli-manager",
+                    arch="x86_64",
+                    public_base_url=args.public_base_url,
+                    release_prefix=args.release_prefix,
+                ),
+                "runtime": artifact_record(
+                    win_runtime,
+                    kind="silent-runtime",
+                    arch="x86_64",
+                    public_base_url=args.public_base_url,
+                    release_prefix=args.release_prefix,
+                ),
+            },
+            "macos-universal": {
+                "manager": artifact_record(
+                    mac_manager,
+                    kind="cli-manager",
+                    arch="universal",
+                    public_base_url=args.public_base_url,
+                    release_prefix=args.release_prefix,
+                ),
+                "runtime": artifact_record(
+                    mac_runtime,
+                    kind="app-bundle-zip",
+                    arch="universal",
+                    public_base_url=args.public_base_url,
+                    release_prefix=args.release_prefix,
+                ),
+            },
         },
     }
 

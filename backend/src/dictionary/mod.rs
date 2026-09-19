@@ -1,4 +1,4 @@
-//! Dictionary Storage System for ListenOS
+//! Dictionary Storage System for Origin Speak
 //!
 //! Custom words and spellings for voice recognition.
 
@@ -60,9 +60,22 @@ impl DictionaryStore {
     }
 
     fn get_db_path() -> Result<PathBuf, String> {
-        let data_dir =
-            dirs_next::data_dir().ok_or_else(|| "Could not find data directory".to_string())?;
-        Ok(data_dir.join("ListenOS").join("dictionary.db"))
+        let candidates = crate::paths::app_data_file_candidates("dictionary.db")?;
+        let active = candidates[0].clone();
+        if crate::paths::path_exists_no_follow(&active) {
+            if crate::paths::regular_file_exists_no_follow(&active) {
+                return Ok(active);
+            }
+            return Err(format!(
+                "Refusing non-regular Origin Speak dictionary path: {}",
+                active.display()
+            ));
+        }
+        Ok(candidates
+            .into_iter()
+            .skip(1)
+            .find(|path| crate::paths::regular_file_exists_no_follow(path))
+            .unwrap_or(active))
     }
 
     fn init_tables(&self) -> Result<(), String> {
@@ -143,21 +156,6 @@ impl DictionaryStore {
             .map_err(|e| format!("Failed to collect words: {}", e))
     }
 
-    /// Check if a word exists in dictionary
-    pub fn word_exists(&self, word: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-
-        let count: i32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM words WHERE LOWER(word) = LOWER(?1)",
-                [word],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to check word: {}", e))?;
-
-        Ok(count > 0)
-    }
-
     /// Update a word
     pub fn update_word(
         &self,
@@ -172,19 +170,6 @@ impl DictionaryStore {
             params![word, phonetic, id],
         )
         .map_err(|e| format!("Failed to update word: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Record word usage
-    pub fn record_usage(&self, word: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-
-        conn.execute(
-            "UPDATE words SET use_count = use_count + 1 WHERE LOWER(word) = LOWER(?1)",
-            [word],
-        )
-        .map_err(|e| format!("Failed to record usage: {}", e))?;
 
         Ok(())
     }

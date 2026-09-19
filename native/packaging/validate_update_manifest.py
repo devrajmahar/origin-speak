@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a generated native updater manifest against the shipping contract."""
+"""Validate the Origin Speak CLI/bootstrap update manifest and artifact hashes."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -30,51 +30,40 @@ def fail(message: str) -> None:
 def validate_artifact(
     record: object,
     *,
-    platform: str,
-    version: str,
+    label: str,
     expected_kind: str,
-    expected_arches: set[str],
-    expected_name_re: re.Pattern[str],
+    expected_arch: str,
+    expected_name: str,
     public_base_url: str,
     release_prefix: str,
     artifact_root: Path,
 ) -> None:
     if not isinstance(record, dict):
-        fail(f"{platform} artifact must be an object")
+        fail(f"{label} artifact must be an object")
     expected_keys = {"kind", "arch", "path", "url", "sha256"}
     if set(record) != expected_keys:
-        fail(
-            f"{platform} artifact keys must be exactly {sorted(expected_keys)}, "
-            f"got {sorted(record)}"
-        )
+        fail(f"{label} artifact keys must be exactly {sorted(expected_keys)}")
     if record["kind"] != expected_kind:
-        fail(f"{platform} kind must be {expected_kind!r}")
-    if record["arch"] not in expected_arches:
-        fail(f"{platform} arch must be one of {sorted(expected_arches)}")
-
-    path = record["path"]
-    if not isinstance(path, str) or not expected_name_re.fullmatch(path):
-        fail(f"{platform} path does not match the shipping filename contract: {path!r}")
-    if platform == "macos":
-        encoded_arch = path.removeprefix(f"ListenOS-{version}-macos-").removesuffix(".dmg")
-        if encoded_arch != record["arch"]:
-            fail("macos path architecture must match the artifact arch field")
+        fail(f"{label} kind must be {expected_kind!r}")
+    if record["arch"] != expected_arch:
+        fail(f"{label} arch must be {expected_arch!r}")
+    if record["path"] != expected_name:
+        fail(f"{label} path must be {expected_name!r}")
 
     expected_url = (
-        f"{public_base_url.rstrip('/')}/{release_prefix.strip('/')}/{quote(path)}"
+        f"{public_base_url.rstrip('/')}/{release_prefix.strip('/')}/{quote(expected_name)}"
     )
     if record["url"] != expected_url:
-        fail(f"{platform} URL must be {expected_url!r}, got {record['url']!r}")
+        fail(f"{label} URL must be {expected_url!r}, got {record['url']!r}")
 
     digest = record["sha256"]
     if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
-        fail(f"{platform} sha256 must be 64 lowercase hexadecimal characters")
-    artifact = artifact_root / path
+        fail(f"{label} sha256 must be 64 lowercase hexadecimal characters")
+    artifact = artifact_root / expected_name
     if not artifact.is_file():
-        fail(f"{platform} artifact is missing: {artifact}")
-    actual = sha256(artifact)
-    if digest != actual:
-        fail(f"{platform} sha256 does not match {artifact.name}")
+        fail(f"{label} artifact is missing: {artifact}")
+    if digest != sha256(artifact):
+        fail(f"{label} sha256 does not match {artifact.name}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,50 +87,62 @@ def main() -> None:
         or public_base.query
         or public_base.fragment
     ):
-        fail(
-            "public base URL must be a credential-free HTTPS origin/path without query or fragment"
-        )
+        fail("public base URL must be a credential-free HTTPS origin/path without query or fragment")
+
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         fail("manifest must be an object")
-    expected_top_keys = {"schema_version", "version", "artifacts"}
-    if set(manifest) != expected_top_keys:
-        fail(
-            f"manifest keys must be exactly {sorted(expected_top_keys)}, "
-            f"got {sorted(manifest)}"
-        )
+    if set(manifest) != {"schema_version", "version", "platforms"}:
+        fail("manifest keys must be exactly schema_version, version, platforms")
     if manifest["schema_version"] != SCHEMA_VERSION:
         fail(f"schema_version must be {SCHEMA_VERSION}")
     if manifest["version"] != args.version:
         fail(f"manifest version must be {args.version!r}")
 
-    artifacts = manifest["artifacts"]
-    if not isinstance(artifacts, dict) or set(artifacts) != {"windows", "macos"}:
-        fail("artifacts must contain exactly windows and macos")
+    platforms = manifest["platforms"]
+    if not isinstance(platforms, dict) or set(platforms) != {"windows-x86_64", "macos-universal"}:
+        fail("platforms must contain exactly windows-x86_64 and macos-universal")
+    for platform, record in platforms.items():
+        if not isinstance(record, dict) or set(record) != {"manager", "runtime"}:
+            fail(f"{platform} must contain exactly manager and runtime payloads")
 
-    escaped_version = re.escape(args.version)
+    version = args.version
     validate_artifact(
-        artifacts["windows"],
-        platform="windows",
-        version=args.version,
-        expected_kind="nsis-installer",
-        expected_arches={"x86_64"},
-        expected_name_re=re.compile(
-            rf"ListenOS-{escaped_version}-Setup-x86_64\.exe"
-        ),
+        platforms["windows-x86_64"]["manager"],
+        label="windows manager",
+        expected_kind="cli-manager",
+        expected_arch="x86_64",
+        expected_name=f"origin-speak-{version}-windows-x86_64.exe",
         public_base_url=args.public_base_url,
         release_prefix=args.release_prefix,
         artifact_root=args.artifact_root,
     )
     validate_artifact(
-        artifacts["macos"],
-        platform="macos",
-        version=args.version,
-        expected_kind="dmg-installer",
-        expected_arches={"universal"},
-        expected_name_re=re.compile(
-            rf"ListenOS-{escaped_version}-macos-universal\.dmg"
-        ),
+        platforms["windows-x86_64"]["runtime"],
+        label="windows runtime",
+        expected_kind="silent-runtime",
+        expected_arch="x86_64",
+        expected_name=f"origin-speak-runtime-{version}-windows-x86_64.exe",
+        public_base_url=args.public_base_url,
+        release_prefix=args.release_prefix,
+        artifact_root=args.artifact_root,
+    )
+    validate_artifact(
+        platforms["macos-universal"]["manager"],
+        label="macos manager",
+        expected_kind="cli-manager",
+        expected_arch="universal",
+        expected_name=f"origin-speak-{version}-macos-universal",
+        public_base_url=args.public_base_url,
+        release_prefix=args.release_prefix,
+        artifact_root=args.artifact_root,
+    )
+    validate_artifact(
+        platforms["macos-universal"]["runtime"],
+        label="macos runtime",
+        expected_kind="app-bundle-zip",
+        expected_arch="universal",
+        expected_name=f"origin-speak-runtime-{version}-macos-universal.zip",
         public_base_url=args.public_base_url,
         release_prefix=args.release_prefix,
         artifact_root=args.artifact_root,

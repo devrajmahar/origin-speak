@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod app;
 mod components;
 mod overlay;
@@ -5,80 +7,126 @@ mod platform_shell;
 mod runtime;
 mod state;
 mod theme;
-mod views;
 
-use app::ListenOsApp;
+use app::OriginSpeakApp;
 use gpui::*;
+use origin_speak_lib::AppConfig;
 use runtime::RuntimeController;
 
 fn main() {
-    // A plain `cargo run -p listenos-native` intentionally builds without a
-    // GPU transcription backend (the Vulkan/Metal SDKs are build-time inputs).
-    // That fallback is the most common cause of "dictation is slow and the
-    // Settings GPU line says CPU": the binary is fine, it was just built
-    // without `--features gpu-vulkan` (Windows, needs the Vulkan SDK) or
-    // `--features gpu-metal` (macOS). Release artifacts always enable the
-    // matching backend. Warn once here so a CPU-only dev build is never
-    // mistaken for broken GPU inference.
-    #[cfg(not(any(feature = "gpu-vulkan", feature = "gpu-metal")))]
-    eprintln!(
-        "[ListenOS] built WITHOUT a GPU transcription backend: Whisper will run on CPU. \
-        For GPU inference on Windows install the Vulkan SDK and run \
-        `cargo run --manifest-path native/Cargo.toml --features gpu-vulkan`; \
-        on macOS use `--features gpu-metal`. See Settings -> System for the active backend."
-    );
-
-    let is_primary = platform_shell::claim_single_instance()
-        .expect("failed to establish ListenOS single-instance ownership");
-    if !is_primary {
+    if let Some(request) = maintenance_autostart_request() {
+        run_autostart_maintenance(request);
         return;
     }
 
-    let runtime = RuntimeController::new().expect("failed to initialize ListenOS native runtime");
-    let launched_minimized = platform_shell::launched_minimized();
-    let launched_from_deep_link = platform_shell::launched_from_deep_link();
-
-    let application = gpui_platform::application();
-    #[cfg(target_os = "macos")]
-    {
-        application.on_open_urls(|_urls| platform_shell::notify_instance_activation());
-        application.on_reopen(|_cx| platform_shell::notify_instance_activation());
+    let is_primary = platform_shell::claim_single_instance()
+        .expect("failed to establish Origin Speak single-instance ownership");
+    if !is_primary {
+        return;
     }
+    platform_shell::start_instance_listener()
+        .expect("failed to start Origin Speak resident control listener");
+    reconcile_persisted_auto_start();
 
+    let runtime =
+        RuntimeController::new().expect("failed to initialize Origin Speak native runtime");
+    let application = gpui_platform::application();
     application.run(move |cx| {
         gpui_base::init(cx);
-        let app = cx.new(|cx| ListenOsApp::new(runtime, cx));
-        let tray_active = app.read(cx).tray_active();
-        let start_hidden = launched_minimized && tray_active && !launched_from_deep_link;
-        let dashboard_bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
-        let dashboard_app = app.clone();
-        let dashboard_window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(dashboard_bounds)),
-                    focus: !start_hidden,
-                    show: !start_hidden,
-                    ..WindowOptions::default()
-                },
-                move |window, cx| {
-                    platform_shell::configure_dashboard_window(window);
-                    let close_app = dashboard_app.clone();
-                    window.on_window_should_close(cx, move |window, cx| {
-                        if close_app.read(cx).tray_active() {
-                            platform_shell::hide_dashboard_window(window);
-                            false
-                        } else {
-                            cx.quit();
-                            false
-                        }
-                    });
-                    dashboard_app
-                },
-            )
-            .expect("failed to open ListenOS native window");
-        app.update(cx, |app, _| app.attach_dashboard_window(dashboard_window));
-        if !start_hidden {
-            cx.activate(true);
-        }
+        theme::configure_base_theme(cx);
+        let mut runtime = runtime;
+        runtime
+            .initialize_shortcuts()
+            .expect("failed to register the Origin Speak global dictation shortcut");
+        let app = cx.new(|cx| OriginSpeakApp::new(runtime, cx));
+
+        // GPUI and global-hotkey both need a live platform event loop. Keep one
+        // permanently hidden anchor window instead of constructing the former
+        // dashboard. The only visible surfaces are the compact status overlays.
+        let bounds = Bounds::centered(None, size(px(1.0), px(1.0)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                titlebar: None,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                ..WindowOptions::default()
+            },
+            move |_, _| app.clone(),
+        )
+        .expect("failed to create Origin Speak resident event-loop window");
+        platform_shell::mark_runtime_ready()
+            .expect("failed to publish Origin Speak runtime readiness");
     });
+    platform_shell::cleanup_instance_control();
+}
+
+#[derive(Clone, Copy)]
+enum AutoStartMaintenance {
+    Enable,
+    Disable,
+    Status,
+}
+
+fn maintenance_autostart_request() -> Option<AutoStartMaintenance> {
+    for argument in std::env::args_os().skip(1) {
+        if argument == "--maintenance-autostart-enable" {
+            return Some(AutoStartMaintenance::Enable);
+        }
+        if argument == "--maintenance-autostart-disable" {
+            return Some(AutoStartMaintenance::Disable);
+        }
+        if argument == "--maintenance-autostart-status" {
+            return Some(AutoStartMaintenance::Status);
+        }
+    }
+    None
+}
+
+fn run_autostart_maintenance(request: AutoStartMaintenance) {
+    let result = match request {
+        AutoStartMaintenance::Enable => platform_shell::set_auto_start_enabled(true),
+        AutoStartMaintenance::Disable => platform_shell::set_auto_start_enabled(false),
+        AutoStartMaintenance::Status => platform_shell::auto_start_status(),
+    };
+    match result {
+        Ok(platform_shell::AutoStartState::Enabled) => std::process::exit(0),
+        Ok(platform_shell::AutoStartState::Disabled) => std::process::exit(10),
+        Ok(platform_shell::AutoStartState::RequiresApproval) => std::process::exit(11),
+        Ok(platform_shell::AutoStartState::Mismatched) => std::process::exit(12),
+        Err(_error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[Origin Speak] autostart maintenance failed: {_error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn reconcile_persisted_auto_start() {
+    if !platform_shell::auto_start_supported() {
+        return;
+    }
+
+    let desired = AppConfig::load_from_disk().unwrap_or_default().auto_start;
+    let needs_change = match platform_shell::auto_start_status() {
+        Ok(platform_shell::AutoStartState::Enabled) => !desired,
+        Ok(platform_shell::AutoStartState::RequiresApproval) => !desired,
+        Ok(platform_shell::AutoStartState::Disabled) => desired,
+        Ok(platform_shell::AutoStartState::Mismatched) => true,
+        Err(_) => true,
+    };
+    if needs_change {
+        let result = platform_shell::set_auto_start_enabled(desired);
+        #[cfg(debug_assertions)]
+        if let Err(error) = result {
+            eprintln!("[Origin Speak] could not reconcile login autostart: {error}");
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = result;
+    }
 }

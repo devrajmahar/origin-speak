@@ -1,74 +1,93 @@
-# Native release packaging
+# Native CLI/bootstrap release packaging
 
-This directory contains the shipping release packaging path for the GPUI application. Tagged releases build and publish native Windows and macOS artifacts only.
+Origin Speak now targets two release binaries instead of a traditional desktop installer:
 
-The packaging entry points expect the native binary to have already been built with:
+- `origin`: console CLI/bootstrap manager for setup, diagnostics, configuration, lifecycle, update and uninstall.
+- `origin-runtime`: silent resident voice process that owns shortcuts and the compact GPUI overlays.
 
-```text
-cargo build --manifest-path native/Cargo.toml --release --locked
-```
+The packaging scripts expect those binaries to exist in `native/target/release/`. `native/Cargo.toml` declares both targets explicitly with automatic binary discovery disabled.
 
 ## Windows
 
-`windows/package.ps1` wraps the release binary in a per-user NSIS installer. It installs `ListenOS.exe` under `%LOCALAPPDATA%\Programs\ListenOS`, creates Start Menu and optional desktop shortcuts, and removes the ListenOS login Run-key value during uninstall so an uninstalled binary is not left as an autostart target.
-
-The script requires `makensis` on `PATH`. CI installs NSIS before invoking it.
-
-Example:
+`windows/package.ps1` copies the two binaries directly and signs them when the Windows certificate/password/timestamp inputs are available. It does not build or launch NSIS. Release artifacts are:
 
 ```text
-powershell -NoProfile -File native/packaging/windows/package.ps1 -Version 0.1.21 -OutputDir dist/native/windows
+origin-speak-<version>-windows-x86_64.exe
+origin-speak-runtime-<version>-windows-x86_64.exe
 ```
 
-Local packages are unsigned unless `WINDOWS_SIGNING_CERTIFICATE_PATH`, `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`, and `WINDOWS_SIGN_TIMESTAMP_URL` are set. Tagged releases require those values through CI and sign both the application executable and the NSIS installer before publication.
+The manager installs the runtime into the per-user Origin Speak directory using Rust/native filesystem APIs. Runtime start/stop does not invoke `cmd.exe` or PowerShell. Local packages are unsigned unless `WINDOWS_SIGNING_CERTIFICATE_PATH`, `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`, and `WINDOWS_SIGN_TIMESTAMP_URL` are set.
+
+```text
+powershell -NoProfile -File native/packaging/windows/package.ps1 -Version 0.1.22 -OutputDir dist/native/windows
+```
+
+The retired NSIS installer source is no longer part of the shipping tree. CLI uninstall contains exact cleanup for its historical registry keys, shortcuts, old executable, and `Uninstall.exe` so upgrades do not leave dead registrations behind.
 
 ## macOS
 
-`macos/package.sh` creates `ListenOS.app`, signs it with the repository's current entitlements, verifies the bundle, and produces a compressed DMG plus a ZIP of the app bundle. Tagged releases build both Apple Silicon and Intel targets and merge them with `lipo`, so the published application and updater DMG are universal. The generated `Info.plist` contains the microphone and Apple Events usage descriptions required by the current application behavior.
-
-Local packages use an ad-hoc signature unless `MACOS_CODESIGN_IDENTITY` names a Developer ID Application identity available in the current keychain. Setting `MACOS_NOTARIZE=1` additionally requires `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`; the script notarizes the signed app, staples it, then notarizes and staples the DMG. Tagged releases require Developer ID signing and notarization before publication.
-
-Example:
+`macos/package.sh` signs the console manager independently and packages the silent runtime in `Origin Speak.app`. The runtime is an `LSUIElement` background app, requests microphone access only for local voice-to-text dictation, and does not advertise the retired legacy `listenos://` URL handler or obsolete Apple Events usage. Accessibility permission remains a runtime/TCC requirement for reliable text injection into other applications. Release artifacts are:
 
 ```text
-bash native/packaging/macos/package.sh 0.1.21 dist/native/macos
+origin-speak-<version>-macos-universal
+origin-speak-runtime-<version>-macos-universal.zip
 ```
 
-The native macOS package currently declares macOS 13.0 as its minimum version. That matches the native shell's `SMAppService` login-item implementation and the supported native release baseline.
+Tagged releases build Apple Silicon and Intel manager/runtime binaries and merge each with `lipo`. With a complete Apple credential set the workflow applies Developer ID signing, notarization, and stapling; without it the package script uses ad-hoc code signing and publishes a clearly marked non-notarized build. There is no DMG in the CLI/bootstrap contract.
 
-## Linux
+```text
+bash native/packaging/macos/package.sh 0.1.22 dist/native/macos
+```
 
-There is no native Linux package in this directory. The current GPUI overlay path explicitly disables the passive status overlay on Linux because it cannot guarantee click-through behavior on both Wayland and X11. The native release workflow reports Linux packaging as unsupported instead of publishing a partial desktop artifact.
+The runtime bundle keeps macOS 13.0 as its minimum version.
 
-## Native updater manifest
+## Bootstrap update manifest
 
-`generate_update_manifest.py` emits `native-update.json`. The release workflow publishes the same manifest at `releases/v<version>/native-update.json` and at the R2 root as `native-update.json`. Artifact URLs inside the manifest always point at the immutable versioned release root.
-
-Tagged Windows and macOS builds compile `LISTENOS_UPDATE_MANIFEST_URL` as `<CLOUDFLARE_R2_PUBLIC_BASE_URL>/native-update.json` before building the native binary. The workflow accepts only a credential-free HTTPS public base URL, and the publication job uses that same base to generate artifact URLs.
-
-The schema is exact and versioned:
+`generate_update_manifest.py` emits schema-v2 `bootstrap-update.json`. Each supported platform contains a separately hashed manager and runtime payload so the CLI can stage and verify both before replacement. Tagged releases publish this manifest, the manager/runtime payloads, platform checksum files, and trust-status sidecars on the canonical GitHub Release at `https://github.com/devrajmahar/origin-speak/releases/tag/v<version>`.
 
 ```json
 {
-  "schema_version": 1,
-  "version": "0.1.21",
-  "artifacts": {
-    "windows": {
-      "kind": "nsis-installer",
-      "arch": "x86_64",
-      "path": "ListenOS-0.1.21-Setup-x86_64.exe",
-      "url": "https://updates.example/releases/v0.1.21/ListenOS-0.1.21-Setup-x86_64.exe",
-      "sha256": "<lowercase hex sha256>"
+  "schema_version": 2,
+  "version": "0.1.22",
+  "platforms": {
+    "windows-x86_64": {
+      "manager": {
+        "kind": "cli-manager",
+        "arch": "x86_64",
+        "path": "origin-speak-0.1.22-windows-x86_64.exe",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.22/origin-speak-0.1.22-windows-x86_64.exe",
+        "sha256": "<lowercase hex sha256>"
+      },
+      "runtime": {
+        "kind": "silent-runtime",
+        "arch": "x86_64",
+        "path": "origin-speak-runtime-0.1.22-windows-x86_64.exe",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.22/origin-speak-runtime-0.1.22-windows-x86_64.exe",
+        "sha256": "<lowercase hex sha256>"
+      }
     },
-    "macos": {
-      "kind": "dmg-installer",
-      "arch": "universal",
-      "path": "ListenOS-0.1.21-macos-universal.dmg",
-      "url": "https://updates.example/releases/v0.1.21/ListenOS-0.1.21-macos-universal.dmg",
-      "sha256": "<lowercase hex sha256>"
+    "macos-universal": {
+      "manager": {
+        "kind": "cli-manager",
+        "arch": "universal",
+        "path": "origin-speak-0.1.22-macos-universal",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.22/origin-speak-0.1.22-macos-universal",
+        "sha256": "<lowercase hex sha256>"
+      },
+      "runtime": {
+        "kind": "app-bundle-zip",
+        "arch": "universal",
+        "path": "origin-speak-runtime-0.1.22-macos-universal.zip",
+        "url": "https://github.com/devrajmahar/origin-speak/releases/download/v0.1.22/origin-speak-runtime-0.1.22-macos-universal.zip",
+        "sha256": "<lowercase hex sha256>"
+      }
     }
   }
 }
 ```
 
-The shipping macOS updater artifact is always `arch: "universal"`, containing both `arm64` and `x86_64` slices. The native runtime accepts the DMG as the installable update package, opens it after SHA-256 verification, and accepts the Windows NSIS executable equivalently. `validate_update_manifest.py` checks the generated manifest, immutable artifact URLs, package names, architectures, and hashes against this shipping contract before publication.
+`validate_update_manifest.py` verifies the exact filenames, kinds, architectures, immutable URLs, and SHA-256 values before publication. `test_update_manifest.py` covers round-trip generation and tamper rejection.
+
+## Linux
+
+No Linux release artifact is published yet. The current passive GPUI overlay cannot guarantee safe click-through behavior across both Wayland and X11, so the CLI must report Linux runtime installation as unsupported instead of implying parity that does not exist.

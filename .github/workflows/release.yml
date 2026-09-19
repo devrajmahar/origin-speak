@@ -39,7 +39,6 @@ jobs:
       WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
       WINDOWS_SIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGN_TIMESTAMP_URL }}
-      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
       VULKAN_SDK_VERSION: "1.4.357.0"
       VULKAN_SDK_SHA256: "81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d"
     steps:
@@ -47,10 +46,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install NSIS
-        shell: pwsh
-        run: choco install nsis --yes --no-progress
 
       - name: Install pinned Vulkan SDK build tools
         shell: pwsh
@@ -82,51 +77,46 @@ jobs:
           "VK_SDK_PATH=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $sdkRoot "Bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Require Windows release signing credentials
+      - name: Detect Windows signing capability
+        id: windows-trust
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX_BASE64)) {
-            throw "Tagged native releases require secret WINDOWS_CERTIFICATE_PFX_BASE64."
+          $values = @(
+            $env:WINDOWS_CERTIFICATE_PFX_BASE64,
+            $env:WINDOWS_CERTIFICATE_PASSWORD,
+            $env:WINDOWS_SIGN_TIMESTAMP_URL
+          )
+          $present = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+          if ($present -eq $values.Count) {
+            "signing_available=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "WINDOWS_SIGNING_AVAILABLE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "WINDOWS_RELEASE_TRUST=signed-and-timestamped" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            "signing_available=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "WINDOWS_SIGNING_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "WINDOWS_RELEASE_TRUST=unsigned" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            if ($present -gt 0) {
+              Write-Warning "Windows signing credentials are incomplete; publishing unsigned artifacts."
+            } else {
+              Write-Host "Windows signing credentials are absent; publishing unsigned artifacts."
+            }
           }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
-            throw "Tagged native releases require secret WINDOWS_CERTIFICATE_PASSWORD."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_TIMESTAMP_URL)) {
-            throw "Tagged native releases require repository variable WINDOWS_SIGN_TIMESTAMP_URL."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:R2_PUBLIC_BASE_URL)) {
-            throw "Tagged native releases require secret CLOUDFLARE_R2_PUBLIC_BASE_URL."
-          }
-
-      - name: Configure native updater endpoint
-        shell: pwsh
-        run: |
-          $baseUrl = $env:R2_PUBLIC_BASE_URL.TrimEnd('/')
-          $uri = $null
-          if (-not [Uri]::TryCreate($baseUrl, [UriKind]::Absolute, [ref]$uri) -or
-              $uri.Scheme -ne 'https' -or
-              [string]::IsNullOrWhiteSpace($uri.Host) -or
-              -not [string]::IsNullOrEmpty($uri.UserInfo) -or
-              -not [string]::IsNullOrEmpty($uri.Query) -or
-              -not [string]::IsNullOrEmpty($uri.Fragment)) {
-            throw "CLOUDFLARE_R2_PUBLIC_BASE_URL must be a credential-free HTTPS origin/path without query or fragment."
-          }
-          "LISTENOS_UPDATE_MANIFEST_URL=$baseUrl/native-update.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Prepare Windows signing certificate
+        if: steps.windows-trust.outputs.signing_available == 'true'
         shell: pwsh
         run: |
-          $certificatePath = Join-Path $env:RUNNER_TEMP "listenos-signing.pfx"
+          $certificatePath = Join-Path $env:RUNNER_TEMP "origin-speak-signing.pfx"
           [IO.File]::WriteAllBytes(
             $certificatePath,
             [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64)
           )
           "WINDOWS_SIGNING_CERTIFICATE_PATH=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build native release binary
-        run: cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-vulkan
+      - name: Build CLI manager and silent runtime
+        run: cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-vulkan --bin origin --bin origin-runtime
 
-      - name: Package and sign Windows installer
+      - name: Package Windows CLI/runtime artifacts
         shell: pwsh
         env:
           WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
@@ -134,6 +124,14 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File native/packaging/windows/package.ps1
           -Version "${{ needs.metadata.outputs.version }}"
           -OutputDir "dist/native/windows"
+
+      - name: Record Windows trust status
+        shell: pwsh
+        run: |
+          @(
+            "platform=windows-x86_64",
+            "trust=$env:WINDOWS_RELEASE_TRUST"
+          ) | Set-Content -LiteralPath "dist/native/windows/TRUST-windows.txt" -Encoding ascii
 
       - name: Remove Windows signing certificate
         if: always()
@@ -143,13 +141,15 @@ jobs:
             Remove-Item -LiteralPath $env:WINDOWS_SIGNING_CERTIFICATE_PATH -Force
           }
 
-      - name: Upload Windows package
+      - name: Upload Windows CLI/runtime artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: native-windows-${{ needs.metadata.outputs.version }}
+          name: origin-speak-windows-${{ needs.metadata.outputs.version }}
           path: |
             dist/native/windows/*.exe
             dist/native/windows/*.sha256
+            dist/native/windows/SHA256SUMS-windows.txt
+            dist/native/windows/TRUST-windows.txt
           if-no-files-found: error
 
   macos:
@@ -159,12 +159,10 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      MACOS_CODESIGN_IDENTITY_SECRET: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      MACOS_NOTARIZE: "1"
-      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -173,58 +171,51 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Require macOS release trust credentials
+      - name: Detect macOS signing and notarization capability
+        id: macos-trust
         shell: bash
         run: |
           set -euo pipefail
-          for variable in \
-            MACOS_CERTIFICATE_P12_BASE64 \
-            MACOS_CERTIFICATE_PASSWORD \
-            MACOS_CODESIGN_IDENTITY \
-            APPLE_ID \
-            APPLE_TEAM_ID \
-            APPLE_APP_SPECIFIC_PASSWORD \
-            R2_PUBLIC_BASE_URL; do
-            if [[ -z "${!variable:-}" ]]; then
-              echo "Tagged native releases require $variable." >&2
-              exit 1
-            fi
+          required=(
+            MACOS_CERTIFICATE_P12_BASE64
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_CODESIGN_IDENTITY_SECRET
+            APPLE_ID
+            APPLE_TEAM_ID
+            APPLE_APP_SPECIFIC_PASSWORD
+          )
+          present=0
+          for variable in "${required[@]}"; do
+            [[ -n "${!variable:-}" ]] && present=$((present + 1))
           done
-
-      - name: Configure native updater endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import os
-          from urllib.parse import urlsplit
-
-          base_url = os.environ["R2_PUBLIC_BASE_URL"].rstrip("/")
-          parsed = urlsplit(base_url)
-          if (
-              parsed.scheme != "https"
-              or not parsed.netloc
-              or parsed.username is not None
-              or parsed.password is not None
-              or parsed.query
-              or parsed.fragment
-          ):
-              raise SystemExit(
-                  "CLOUDFLARE_R2_PUBLIC_BASE_URL must be a credential-free HTTPS origin/path without query or fragment."
-              )
-          print(f"LISTENOS_UPDATE_MANIFEST_URL={base_url}/native-update.json")
-          PY
+          if [[ "$present" -eq "${#required[@]}" ]]; then
+            echo "notarize=true" >> "$GITHUB_OUTPUT"
+            echo "MACOS_RELEASE_TRUST=developer-id-notarized" >> "$GITHUB_ENV"
+            echo "MACOS_NOTARIZE=1" >> "$GITHUB_ENV"
+            echo "MACOS_CODESIGN_IDENTITY=$MACOS_CODESIGN_IDENTITY_SECRET" >> "$GITHUB_ENV"
+          else
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+            echo "MACOS_RELEASE_TRUST=ad-hoc" >> "$GITHUB_ENV"
+            echo "MACOS_NOTARIZE=0" >> "$GITHUB_ENV"
+            echo "MACOS_CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            if [[ "$present" -gt 0 ]]; then
+              echo "::warning::macOS signing/notarization credentials are incomplete; publishing ad-hoc signed artifacts."
+            else
+              echo "macOS signing/notarization credentials are absent; publishing ad-hoc signed artifacts."
+            fi
+          fi
 
       - name: Import Developer ID certificate
+        if: steps.macos-trust.outputs.notarize == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          KEYCHAIN_PATH="$RUNNER_TEMP/listenos-signing.keychain-db"
-          CERTIFICATE_PATH="$RUNNER_TEMP/listenos-signing.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/origin-speak-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/origin-speak-signing.p12"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           python3 - <<'PY'
           import base64, os, pathlib
-          pathlib.Path(os.environ["RUNNER_TEMP"], "listenos-signing.p12").write_bytes(
+          pathlib.Path(os.environ["RUNNER_TEMP"], "origin-speak-signing.p12").write_bytes(
               base64.b64decode(os.environ["MACOS_CERTIFICATE_P12_BASE64"], validate=True)
           )
           PY
@@ -246,36 +237,44 @@ jobs:
           echo "MACOS_RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           rm -f "$CERTIFICATE_PATH"
 
-      - name: Build native release binary
+      - name: Build universal CLI manager and silent runtime
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target aarch64-apple-darwin
-          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target x86_64-apple-darwin
+          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target aarch64-apple-darwin --bin origin --bin origin-runtime
+          cargo build --manifest-path native/Cargo.toml --release --locked --features gpu-metal --target x86_64-apple-darwin --bin origin --bin origin-runtime
           mkdir -p native/target/release
-          lipo -create \
-            native/target/aarch64-apple-darwin/release/listenos-native \
-            native/target/x86_64-apple-darwin/release/listenos-native \
-            -output native/target/release/listenos-native
-          ARCHS="$(lipo -archs native/target/release/listenos-native)"
-          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
+          for binary in origin origin-runtime; do
+            lipo -create \
+              "native/target/aarch64-apple-darwin/release/$binary" \
+              "native/target/x86_64-apple-darwin/release/$binary" \
+              -output "native/target/release/$binary"
+            ARCHS="$(lipo -archs "native/target/release/$binary")"
+            [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
+          done
 
-      - name: Package, sign, and notarize macOS release
+      - name: Package macOS CLI/runtime artifacts
         shell: bash
         run: |
           bash native/packaging/macos/package.sh "${{ needs.metadata.outputs.version }}" "dist/native/macos"
 
-      - name: Inspect packaged app
+      - name: Inspect packaged runtime app and manager
         shell: bash
         run: |
           set -euo pipefail
-          ARCHS="$(lipo -archs dist/native/macos/ListenOS.app/Contents/MacOS/ListenOS)"
+          ARCHS="$(lipo -archs "dist/native/macos/Origin Speak.app/Contents/MacOS/origin-runtime")"
           [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
-          plutil -lint dist/native/macos/ListenOS.app/Contents/Info.plist
-          codesign --verify --deep --strict --verbose=2 dist/native/macos/ListenOS.app
-          xcrun stapler validate dist/native/macos/ListenOS.app
-          hdiutil verify dist/native/macos/*.dmg
-          xcrun stapler validate dist/native/macos/*.dmg
+          plutil -lint "dist/native/macos/Origin Speak.app/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "dist/native/macos/Origin Speak.app"
+          codesign --verify --strict --verbose=2 dist/native/macos/origin-speak-*-macos-universal
+          if [[ "$MACOS_RELEASE_TRUST" == "developer-id-notarized" ]]; then
+            xcrun stapler validate "dist/native/macos/Origin Speak.app"
+          fi
+
+      - name: Record macOS trust status
+        shell: bash
+        run: |
+          printf 'platform=macos-universal\ntrust=%s\n' "$MACOS_RELEASE_TRUST" > dist/native/macos/TRUST-macos.txt
 
       - name: Remove macOS signing keychain
         if: always()
@@ -285,80 +284,96 @@ jobs:
             security delete-keychain "$MACOS_RELEASE_KEYCHAIN" || true
           fi
 
-      - name: Upload macOS package
+      - name: Upload macOS CLI/runtime artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: native-macos-${{ needs.metadata.outputs.version }}
+          name: origin-speak-macos-${{ needs.metadata.outputs.version }}
           path: |
-            dist/native/macos/*.dmg
+            dist/native/macos/origin-speak-*-macos-universal
             dist/native/macos/*.zip
-            dist/native/macos/SHA256SUMS.txt
+            dist/native/macos/SHA256SUMS-macos.txt
+            dist/native/macos/TRUST-macos.txt
           if-no-files-found: error
 
-  publish-r2:
+  publish-github-release:
     runs-on: ubuntu-latest
     needs: [metadata, windows, macos]
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      R2_ENDPOINT: ${{ secrets.CLOUDFLARE_R2_ENDPOINT }}
-      R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
-      R2_PUBLIC_BASE_URL: ${{ secrets.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: native-*
+          pattern: origin-speak-*
           path: dist/publish
           merge-multiple: true
 
       - uses: actions/checkout@v4
 
-      - name: Require R2 publication configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          for variable in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_BASE_URL; do
-            if [[ -z "${!variable:-}" ]]; then
-              echo "Tagged native releases require $variable publication configuration." >&2
-              exit 1
-            fi
-          done
-
-      - name: Generate native updater manifest
+      - name: Generate CLI/bootstrap update manifest
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ needs.metadata.outputs.version }}"
           python3 native/packaging/generate_update_manifest.py \
             --version "$VERSION" \
-            --public-base-url "$R2_PUBLIC_BASE_URL" \
-            --release-prefix "releases/v$VERSION" \
+            --public-base-url "https://github.com/devrajmahar/origin-speak" \
+            --release-prefix "releases/download/v$VERSION" \
             --artifact-root dist/publish \
-            --output dist/publish/native-update.json
+            --output dist/publish/bootstrap-update.json
 
-      - name: Validate native updater contract
+      - name: Validate CLI/bootstrap update contract
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ needs.metadata.outputs.version }}"
           python3 native/packaging/validate_update_manifest.py \
-            --manifest dist/publish/native-update.json \
+            --manifest dist/publish/bootstrap-update.json \
             --version "$VERSION" \
-            --public-base-url "$R2_PUBLIC_BASE_URL" \
-            --release-prefix "releases/v$VERSION" \
+            --public-base-url "https://github.com/devrajmahar/origin-speak" \
+            --release-prefix "releases/download/v$VERSION" \
             --artifact-root dist/publish
 
-      - name: Upload native release files to Cloudflare R2
+      - name: Compose GitHub Release notes
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ needs.metadata.outputs.version }}"
-          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/releases/v${VERSION}/" \
-            --recursive \
-            --endpoint-url "$R2_ENDPOINT" \
-            --no-progress
-          aws s3 cp dist/publish/ "s3://${R2_BUCKET}/" \
-            --recursive \
-            --endpoint-url "$R2_ENDPOINT" \
-            --no-progress
+          WINDOWS_TRUST="$(sed -n 's/^trust=//p' dist/publish/TRUST-windows.txt)"
+          MACOS_TRUST="$(sed -n 's/^trust=//p' dist/publish/TRUST-macos.txt)"
+          if [[ "$WINDOWS_TRUST" == "signed-and-timestamped" ]]; then
+            WINDOWS_NOTE="signed and timestamped"
+          else
+            WINDOWS_NOTE="unsigned (Windows signing credentials were unavailable or incomplete)"
+          fi
+          if [[ "$MACOS_TRUST" == "developer-id-notarized" ]]; then
+            MACOS_NOTE="Developer ID signed and Apple notarized"
+          else
+            MACOS_NOTE="ad-hoc signed and not notarized (Apple release credentials were unavailable or incomplete)"
+          fi
+          cat > dist/release-notes.md <<EOF
+          Origin Speak v$VERSION
+
+          Release assets include the origin CLI manager, the origin-runtime resident runtime, platform checksum files, and bootstrap-update.json.
+
+          Trust status:
+          - Windows: $WINDOWS_NOTE.
+          - macOS: $MACOS_NOTE.
+
+          Update manifest URLs point to this GitHub Release under releases/download/v$VERSION.
+          EOF
+
+      - name: Publish GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.metadata.outputs.version }}"
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Origin Speak $TAG" --notes-file dist/release-notes.md
+          else
+            gh release create "$TAG" --verify-tag --title "Origin Speak $TAG" --notes-file dist/release-notes.md
+          fi
+          mapfile -t ASSETS < <(find dist/publish -maxdepth 1 -type f -print | sort)
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber

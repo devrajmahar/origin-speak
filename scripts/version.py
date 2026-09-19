@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep ListenOS native/backend Cargo package versions in sync."""
+"""Keep Origin Speak native/backend Cargo package versions in sync."""
 
 from __future__ import annotations
 
@@ -91,12 +91,12 @@ def apply_version(version: str) -> None:
     )
     write_if_changed(
         BACKEND_LOCK,
-        update_lock(backend_lock, ["listenos-backend"], version),
+        update_lock(backend_lock, ["origin-speak-backend"], version),
         f"backend/Cargo.lock -> {version}",
     )
     write_if_changed(
         NATIVE_LOCK,
-        update_lock(native_lock, ["listenos-backend", "listenos-native"], version),
+        update_lock(native_lock, ["origin-speak-backend", "origin-speak-native"], version),
         f"native/Cargo.lock -> {version}",
     )
 

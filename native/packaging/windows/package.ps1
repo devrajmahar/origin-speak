@@ -9,15 +9,16 @@ param(
     [string]$OutputDir = "dist/native/windows",
 
     [Parameter(Mandatory = $false)]
-    [string]$BinaryPath
+    [string]$ManagerBinaryPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$RuntimeBinaryPath
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
-$installerScript = (Resolve-Path (Join-Path $PSScriptRoot "installer.nsi")).Path
-$iconPath = (Resolve-Path (Join-Path $projectRoot "native\assets\app-icon.ico")).Path
 
 function Resolve-SignTool {
     $fromPath = Get-Command signtool.exe -ErrorAction SilentlyContinue
@@ -37,7 +38,7 @@ function Resolve-SignTool {
         }
     }
 
-    throw "signtool.exe was not found. Install a Windows SDK before signing ListenOS."
+    throw "signtool.exe was not found. Install a Windows SDK before signing Origin Speak."
 }
 
 function Invoke-CodeSign([string]$Path) {
@@ -73,11 +74,25 @@ function Invoke-CodeSign([string]$Path) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
-    $BinaryPath = Join-Path $projectRoot "native\target\release\listenos-native.exe"
+function Resolve-RequiredBinary([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Label binary is missing: $Path"
+    }
+    return (Resolve-Path -LiteralPath $Path).Path
 }
-$BinaryPath = (Resolve-Path $BinaryPath).Path
-Invoke-CodeSign $BinaryPath
+
+if ([string]::IsNullOrWhiteSpace($ManagerBinaryPath)) {
+    $ManagerBinaryPath = Join-Path $projectRoot "native\target\release\origin.exe"
+}
+if ([string]::IsNullOrWhiteSpace($RuntimeBinaryPath)) {
+    $RuntimeBinaryPath = Join-Path $projectRoot "native\target\release\origin-runtime.exe"
+}
+
+$ManagerBinaryPath = Resolve-RequiredBinary $ManagerBinaryPath "Origin Speak CLI manager"
+$RuntimeBinaryPath = Resolve-RequiredBinary $RuntimeBinaryPath "Origin Speak silent runtime"
+if ($ManagerBinaryPath -eq $RuntimeBinaryPath) {
+    throw "CLI manager and runtime must be separate binaries."
+}
 
 if ([System.IO.Path]::IsPathRooted($OutputDir)) {
     $resolvedOutputDir = $OutputDir
@@ -87,34 +102,25 @@ if ([System.IO.Path]::IsPathRooted($OutputDir)) {
 [System.IO.Directory]::CreateDirectory($resolvedOutputDir) | Out-Null
 $resolvedOutputDir = (Resolve-Path $resolvedOutputDir).Path
 
-$makensis = Get-Command makensis -ErrorAction SilentlyContinue
-if ($null -eq $makensis) {
-    throw "makensis was not found on PATH. Install NSIS before packaging ListenOS."
+$managerName = "origin-speak-$Version-windows-x86_64.exe"
+$runtimeName = "origin-speak-runtime-$Version-windows-x86_64.exe"
+$managerArtifact = Join-Path $resolvedOutputDir $managerName
+$runtimeArtifact = Join-Path $resolvedOutputDir $runtimeName
+
+Copy-Item -LiteralPath $ManagerBinaryPath -Destination $managerArtifact -Force
+Copy-Item -LiteralPath $RuntimeBinaryPath -Destination $runtimeArtifact -Force
+Invoke-CodeSign $managerArtifact
+Invoke-CodeSign $runtimeArtifact
+
+$sumLines = @()
+foreach ($artifact in @($managerArtifact, $runtimeArtifact)) {
+    $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
+    $name = [System.IO.Path]::GetFileName($artifact)
+    $line = "$($hash.Hash.ToLowerInvariant())  $name"
+    $line | Set-Content -LiteralPath "$artifact.sha256" -Encoding ascii
+    $sumLines += $line
 }
+$sumLines | Set-Content -LiteralPath (Join-Path $resolvedOutputDir "SHA256SUMS-windows.txt") -Encoding ascii
 
-$artifactName = "ListenOS-$Version-Setup-x86_64.exe"
-$artifactPath = Join-Path $resolvedOutputDir $artifactName
-
-& $makensis.Source `
-    "/V2" `
-    "/DAPP_VERSION=$Version" `
-    "/DBUILD_EXE=$BinaryPath" `
-    "/DICON_FILE=$iconPath" `
-    "/DOUTPUT_FILE=$artifactPath" `
-    $installerScript
-
-if ($LASTEXITCODE -ne 0) {
-    throw "makensis failed with exit code $LASTEXITCODE"
-}
-if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
-    throw "NSIS completed without producing $artifactPath"
-}
-
-Invoke-CodeSign $artifactPath
-
-$hash = Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
-$hashPath = Join-Path $resolvedOutputDir "$artifactName.sha256"
-"$($hash.Hash.ToLowerInvariant())  $artifactName" | Set-Content -LiteralPath $hashPath -Encoding ascii
-
-Write-Host "Created $artifactPath"
-Write-Host "SHA256 $($hash.Hash.ToLowerInvariant())"
+Write-Host "Created $managerArtifact"
+Write-Host "Created $runtimeArtifact"

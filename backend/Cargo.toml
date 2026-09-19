@@ -1,8 +1,8 @@
 [package]
-name = "listenos-backend"
-version = "0.1.21"
-description = "ListenOS - AI-Powered Voice Control System"
-authors = ["ListenOS"]
+name = "origin-speak-backend"
+version = "0.1.22"
+description = "Origin Speak - local voice-to-text dictation engine"
+authors = ["Origin Speak"]
 license = "PROPRIETARY"
 edition = "2021"
 
@@ -15,7 +15,7 @@ gpu-vulkan = ["whisper-rs/vulkan"]
 gpu-metal = ["whisper-rs/metal"]
 
 [lib]
-name = "voice_os_lib"
+name = "origin_speak_lib"
 crate-type = ["rlib"]
 
 [dependencies]
@@ -33,15 +33,16 @@ rubato = "0.16"
 # Local speech-to-text
 whisper-rs = "0.16.0"
 
-# Async Runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime primitives used by transcription/download/capture coordination
+tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
 
 futures-util = "0.3"
 
-# HTTP for model downloads and local integrations
-reqwest = { version = "0.11", features = ["blocking", "json", "stream"] }
+# HTTP for model downloads
+reqwest = { version = "0.11", features = ["stream"] }
+sha2 = "0.10"
 
-# System Control
+# Text delivery
 enigo = "0.2"
 
 # Logging
@@ -51,10 +52,7 @@ log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID
-uuid = { version = "1", features = ["v4", "serde"] }
-
-# URL handling
-url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 # SQLite for persistent storage
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -64,9 +62,6 @@ arboard = "3"
 
 # Directory paths
 dirs-next = "2"
-
-# Lazy initialization
-lazy_static = "1.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.56", features = [

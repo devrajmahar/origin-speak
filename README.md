@@ -1,20 +1,26 @@
-# ListenOS
+# Origin Speak
 
-AI-powered native desktop voice control for Windows and macOS.
+Open-source, fully native local voice-to-text for Windows and macOS.
 
-ListenOS is a single-process Rust desktop application built with GPUI. The application owns its UI components on top of `gpui-base` and links the reusable Rust voice engine directly in-process through `voice_os_lib`.
+Origin Speak is split into two native Rust programs:
+
+- `origin`: the console manager for setup, models, microphones, configuration, lifecycle, updates, and uninstall.
+- `origin-runtime`: the silent resident GPUI process that owns the global dictation hotkey, microphone capture, local Whisper transcription, text delivery, and compact status overlay.
+
+There is no Electron, React, Node.js, browser/WebView runtime, HTTP bridge, JSON-RPC bridge, cloud transcription service, or assistant/action layer in the product architecture.
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-blue) ![GPUI](https://img.shields.io/badge/GPUI-native-3e63dd) ![Rust](https://img.shields.io/badge/Rust-stable-red)
 
 ## Features
 
-- Push-to-talk dictation and assistant mode with configurable global shortcuts
-- Local Whisper transcription and model management
-- Voice-to-action command execution with confirmation for sensitive actions
-- Conversation history, clipboard tools, dictionary, snippets, custom commands, integrations, and style controls
-- Native tray/menu-bar lifecycle, autostart, single-instance activation, and `listenos://` deep links
-- Native update checks with verified release manifests and package hashes
-- Local settings and persistence with no web runtime or separate backend process
+- One configurable hold-to-talk dictation hotkey
+- Local Whisper transcription with CPU, Vulkan (Windows), or Metal (macOS) execution
+- Verified local model downloads pinned to immutable revisions and SHA-256 digests
+- Recognition dictionary hints for names and specialized vocabulary
+- Reliable focused-application text delivery with clipboard recovery when direct delivery fails
+- Silent resident runtime with compact `Listening`, `Processing`, `Success`, and `Error` overlay states
+- CLI-managed model, microphone, hotkey, autostart, update, runtime, and configuration workflows
+- Safe uninstall that removes app-owned models, config, databases, runtime state, and installed binaries by default; `--keep-data` is the explicit opt-out
 
 ## Supported desktop releases
 
@@ -23,41 +29,109 @@ ListenOS is a single-process Rust desktop application built with GPUI. The appli
 - Windows 10/11 (64-bit)
 - Rust stable
 - Visual Studio Build Tools with the C++ workload
-- NSIS only when building an installer locally
+- Vulkan SDK only when building the Vulkan Whisper backend
 
 ### macOS
 
 - macOS 13+
 - Rust stable
 - Xcode Command Line Tools
-- Microphone and Accessibility permissions for voice capture and automation
+- Microphone permission for capture
+- Accessibility permission for text injection into other applications
 
-Native Linux packaging is intentionally not shipped yet. The current GPUI path cannot guarantee safe click-through behavior for passive overlay surfaces on both Wayland and X11. Linux release support requires a native package/desktop entry, protocol and autostart integration, and a safe cross-backend overlay/input implementation.
+Native Linux packaging is intentionally not shipped yet. The current GPUI overlay path cannot guarantee safe passive-overlay behavior across both Wayland and X11. Linux release support also needs a supported native install/autostart lifecycle.
 
-## Quick start
+## Run from source
+
+Build the manager and resident runtime separately:
 
 ```bash
-cargo run --manifest-path native/Cargo.toml
+cargo build --manifest-path native/Cargo.toml --bin origin --bin origin-runtime
 ```
 
-That plain build is CPU-only for transcription. For GPU-accelerated local Whisper, build with the platform backend (Windows needs the Vulkan SDK installed):
+For GPU-accelerated local Whisper:
 
 ```bash
 # Windows (requires the Vulkan SDK)
-cargo run --manifest-path native/Cargo.toml --features gpu-vulkan
+cargo build --manifest-path native/Cargo.toml --features gpu-vulkan --bin origin --bin origin-runtime
+
 # macOS
-cargo run --manifest-path native/Cargo.toml --features gpu-metal
+cargo build --manifest-path native/Cargo.toml --features gpu-metal --bin origin --bin origin-runtime
 ```
 
-Settings -> System shows the active backend (`Active · Vulkan …` / `Active · Metal …` versus a CPU-fallback reason). If you are stuck on CPU, prefer the `tiny.en` model for much lower latency; `base.en` on CPU takes several seconds per utterance.
+The plain build uses CPU transcription. `tiny.en` is the lowest-latency English model on CPU-constrained machines; `base.en` provides a larger default model when the machine has sufficient headroom.
 
-Dictation runs locally with Whisper and does not require an API key. During first-run model setup, ListenOS downloads the selected model into the per-user ListenOS models directory:
+## CLI setup
+
+The manager is the configuration surface. Typical commands are:
 
 ```text
-<user data directory>/ListenOS/models
+origin setup
+origin status
+origin doctor
+origin model list
+origin model download tiny.en
+origin model select tiny.en
+origin mic list
+origin mic test
+origin hotkey show
+origin hotkey set Ctrl+Space
+origin config list
+origin autostart status
+origin start
+origin stop
+origin restart
+origin update check
+origin uninstall
 ```
 
-Models and microphones can be changed later under `Settings -> System` and `Settings -> General`.
+`origin setup` is idempotent: it keeps an already-valid model and matching configuration, downloads a model only when needed, installs the resident runtime, and can configure microphone/autostart choices.
+
+Dictation uses local Whisper and does not require an API key. Models live under app-owned per-user Origin Speak model roots. Current installs prefer the local-data root; legacy ListenOS roots are discovered only for migration/cleanup compatibility. `origin uninstall` removes both current and recognized legacy model roots by default without deleting their parent data directories.
+
+## Default shortcut and overlay
+
+| Action | Default | Behavior |
+|---|---|---|
+| Dictation | `Meta+Ctrl+Space` on Windows/Linux development, `Ctrl+Space` on macOS | Hold to record; release to transcribe and deliver text |
+
+Change it with `origin hotkey set <chord>` and restart/reload the resident runtime so the global registration is refreshed.
+
+The resident UI is intentionally minimal. There is no dashboard or settings window. A compact non-activating overlay reports only `Listening`, `Processing`, `Success`, and `Error`; it must never steal focus from the application receiving dictated text.
+
+## Architecture
+
+```text
+origin CLI manager
+   | setup/config/models/mic/update/lifecycle/uninstall
+   v
+app-owned config + model/data roots
+
+origin-runtime
+   |
+   +-- global dictation hotkey
+   +-- CPAL microphone capture
+   +-- local Whisper inference
+   +-- focused-app text delivery
+   `-- compact GPUI status overlay
+```
+
+Repository layout:
+
+```text
+origin-speak/
+|-- native/
+|   |-- src/                 # CLI manager, resident runtime, platform lifecycle
+|   `-- packaging/           # Separate manager/runtime release artifact helpers
+|-- backend/                 # Reusable local dictation engine (rlib)
+|   `-- src/                 # audio, streaming, transcription, delivery, dictionary
+|-- scripts/                 # Release/version helpers
+`-- docs/
+```
+
+The runtime calls the Rust core directly through typed in-process APIs. CPU/GPU-heavy inference, downloads, persistence, and other blocking work stay off the GPUI render thread.
+
+See [`docs/gpui-native-architecture.md`](docs/gpui-native-architecture.md) and [`docs/cli-management.md`](docs/cli-management.md) for implementation details.
 
 ## Build and validation
 
@@ -66,72 +140,13 @@ cargo fmt --manifest-path backend/Cargo.toml -- --check
 cargo test --manifest-path backend/Cargo.toml --locked
 cargo fmt --manifest-path native/Cargo.toml -- --check
 cargo check --manifest-path native/Cargo.toml --locked
-cargo build --manifest-path native/Cargo.toml --release --locked
 ```
-
-Native release packaging lives under `native/packaging/`. Windows uses a per-user NSIS installer. macOS produces a signed application bundle, DMG, and ZIP; tagged releases require production signing credentials and notarization.
-
-## Default shortcuts
-
-| Action | Default | Behavior |
-|---|---|---|
-| Hold-to-talk | `Meta+Ctrl+Space` on Windows/Linux, `Ctrl+Space` on macOS | Hold to record, release to process |
-| Assistant mode | `Ctrl+Alt+Space` | Toggle hands-free listening |
-
-Both shortcuts are configurable under `Settings -> General`.
-
-## Architecture
-
-```text
-global shortcuts / native windows / tray / updater
-                         |
-                         v
-                     GPUI app
-                         |
-                         v
-                  voice_os_lib
-              /       |       \
-           audio   whisper   state/delivery
-```
-
-Repository layout:
-
-```text
-ListenOS/
-|-- native/                  # GPUI desktop application and platform shell
-|   |-- src/                 # Native windows, state, runtime bridge, views
-|   `-- packaging/           # Windows/macOS packaging and update metadata helpers
-|-- backend/                 # Reusable Rust application/voice core (rlib)
-|   `-- src/
-|       |-- commands/        # Typed application operations
-|       |-- shortcuts.rs     # Transport-independent global shortcuts
-|       |-- audio/
-|       `-- transcription/   # Local Whisper model management and inference
-|-- scripts/                 # Small release-version helpers
-`-- docs/
-```
-
-The desktop runtime is one Rust process. GPUI calls typed core APIs directly. CPU-heavy transcription, downloads, persistence, update I/O, and other blocking work run away from the GPUI render thread.
-
-The UI layering is application-owned:
-
-```text
-ListenOS UI / components
-          |
-          v
-      gpui-base
-          |
-          v
-         GPUI
-```
-
-See [`docs/gpui-native-architecture.md`](docs/gpui-native-architecture.md) for architecture and release-readiness requirements.
 
 ## Releases
 
-Tagged releases use `.github/workflows/release.yml` to build the native Windows and macOS applications. Windows release artifacts are code-signed and timestamped. macOS release artifacts require Developer ID signing and notarization. The workflow publishes release packages and `native-update.json` to Cloudflare R2 for the native updater.
+Tagged releases publish the manager/runtime payloads, `bootstrap-update.json`, checksum files, and trust-status metadata on GitHub Releases at `devrajmahar/origin-speak`. Windows artifacts are signed and timestamped when the repository signing inputs are available, otherwise the release marks them unsigned. macOS artifacts use Developer ID signing and notarization when the full Apple credential set is available, otherwise the release publishes ad-hoc signed, non-notarized artifacts and says so in the release notes.
 
-Version changes use one Python standard-library helper:
+Version changes use the standard-library helper:
 
 ```bash
 python scripts/version.py bump 0.1.22
@@ -140,4 +155,4 @@ python scripts/version.py sync
 
 ## License
 
-Proprietary software. See [LICENSE](LICENSE). Third-party attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Origin Speak is open-source software released under the [MIT License](LICENSE). Third-party attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

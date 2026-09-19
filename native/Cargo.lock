@@ -3456,57 +3456,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "listenos-backend"
-version = "0.1.21"
-dependencies = [
- "arboard",
- "chrono",
- "cpal",
- "dirs-next",
- "enigo",
- "futures-util",
- "global-hotkey",
- "lazy_static",
- "log",
- "reqwest",
- "rubato",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "uuid",
- "whisper-rs",
- "windows 0.56.0",
-]
-
-[[package]]
-name = "listenos-native"
-version = "0.1.21"
-dependencies = [
- "chrono",
- "embed-resource",
- "futures-util",
- "gpui-base",
- "gpui-pre",
- "gpui-pre-platform",
- "listenos-backend",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "objc2-service-management",
- "raw-window-handle",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "uuid",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4630,6 +4579,56 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "origin-speak-backend"
+version = "0.1.22"
+dependencies = [
+ "arboard",
+ "chrono",
+ "cpal",
+ "dirs-next",
+ "enigo",
+ "futures-util",
+ "global-hotkey",
+ "log",
+ "reqwest",
+ "rubato",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+ "whisper-rs",
+ "windows 0.56.0",
+]
+
+[[package]]
+name = "origin-speak-native"
+version = "0.1.22"
+dependencies = [
+ "chrono",
+ "embed-resource",
+ "futures-util",
+ "gpui-base",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-service-management",
+ "origin-speak-backend",
+ "raw-window-handle",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -6495,9 +6494,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",

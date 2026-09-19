@@ -1,6 +1,8 @@
-# Contributing to ListenOS
+# Contributing to Origin Speak
 
-ListenOS is proprietary software. Coordinate with maintainers before starting major work.
+Origin Speak is an open-source native Rust voice-to-text application released under the MIT License. The product consists of the `origin` CLI manager and the silent resident `origin-runtime`; the backend is a reusable local dictation engine. Contributions must not reintroduce an Electron, React, Node.js, browser/WebView, HTTP, or JSON-RPC compatibility layer.
+
+Coordinate with maintainers before starting major architectural work.
 
 ## Workflow
 
@@ -11,29 +13,30 @@ ListenOS is proprietary software. Coordinate with maintainers before starting ma
    - `cargo test --manifest-path backend/Cargo.toml --locked`
    - `cargo fmt --manifest-path native/Cargo.toml -- --check`
    - `cargo check --manifest-path native/Cargo.toml --locked`
-   - `cargo run --manifest-path native/Cargo.toml` (quick manual sanity check for UI/runtime changes)
-4. Open a PR with:
-   - Problem statement
-   - Implementation summary
-   - Validation steps and results
-   - Screenshots/video for UI changes
+4. Open a PR with a problem statement, implementation summary, validation results, and screenshots/video only when the compact overlay itself changes.
 
-## Product Constraints
+## Product constraints
 
-- Desktop app is self-hosted first: do not reintroduce login-gated dashboard flows.
-- Keep first-run onboarding behavior intact unless a task explicitly requests temporary disablement.
-- Dictation is local-first and uses local Whisper models; do not add an API-key requirement to the transcription flow.
-- Voice flow should execute and transcribe without spoken voice playback.
-- Avoid Bluetooth hands-free microphone routing that can hijack headphone output.
+- The product is voice-to-text only. Do not add assistant intent routing, actions, command execution, conversations, confirmations, snippets, notes, clipboard history, or style/vibe transformation back into the production path.
+- Keep transcription local with Whisper; do not add an API-key or cloud-transcription requirement.
+- Keep one dictation shortcut. Do not add a second assistant/hands-free shortcut.
+- Keep the resident UI limited to the compact `Listening`, `Processing`, `Success`, and `Error` overlay states.
+- Models, microphones, hotkey, autostart, lifecycle, updates, and persisted configuration are managed through `origin`, not a dashboard/settings UI.
+- Recognition dictionary hints remain a supported local STT feature.
+- Avoid Bluetooth hands-free microphone routing when it would switch the headset into low-quality telephony mode or hijack output audio.
+- Uninstall must remove app-owned data/models by default and must never recursively delete unvalidated parent directories or follow symlinks/reparse points.
 
-## Code Guidelines
+## Code guidelines
 
 - Match existing Rust style and naming.
-- Prefer minimal, root-cause fixes over broad refactors.
-- Keep UX responsive; avoid adding extra latency in hotkey/audio paths.
-- Update `README.md` when behavior, setup, or configuration changes.
+- Prefer minimal root-cause fixes over broad abstraction layers.
+- Keep startup and hotkey/audio paths low-latency; never hash multi-GB model files repeatedly on hot readiness paths.
+- Keep model downloads immutable-revision pinned, SHA-256 verified, resumable, and atomically installed.
+- Keep blocking audio/model/download work away from the GPUI render thread.
+- Update `README.md`, `SETUP.md`, and relevant architecture docs when CLI/runtime behavior changes.
 
-## Security and Privacy
+## Security and privacy
 
 - Never commit secrets or real API keys.
-- Treat local data handling changes as high impact and document them in PR notes.
+- Treat model integrity, update integrity, text injection, local databases, and uninstall path validation as security-sensitive code.
+- Document any change to app-owned data roots or deletion behavior in the PR.

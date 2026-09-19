@@ -1,7 +1,13 @@
 mod resampler;
 
 use futures_util::StreamExt;
+use reqwest::{
+    header::{CONTENT_RANGE, RANGE},
+    StatusCode,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -9,19 +15,38 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, Once, OnceLock,
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 pub const DEFAULT_MODEL: &str = "base.en";
 const GGML_MAGIC: [u8; 4] = *b"lmgg";
+const MIN_MODEL_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_MODEL_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedModelIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    expected_sha256: &'static str,
+}
+
+static VERIFIED_MODELS: OnceLock<Mutex<HashMap<PathBuf, VerifiedModelIdentity>>> = OnceLock::new();
+
+#[cfg(test)]
+static SHA256_FILE_CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct ModelSpec {
     id: &'static str,
     label: &'static str,
     filename: &'static str,
+    revision: &'static str,
+    sha256: &'static str,
+    tier: &'static str,
+    english_only: bool,
+    recommended: bool,
 }
 
 const MODELS: &[ModelSpec] = &[
@@ -29,51 +54,101 @@ const MODELS: &[ModelSpec] = &[
         id: "tiny.en",
         label: "Tiny English",
         filename: "ggml-tiny.en.bin",
+        revision: "80da2d8",
+        sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+        tier: "tiny",
+        english_only: true,
+        recommended: false,
     },
     ModelSpec {
         id: "base.en",
         label: "Base English",
         filename: "ggml-base.en.bin",
+        revision: "80da2d8",
+        sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        tier: "base",
+        english_only: true,
+        recommended: true,
     },
     ModelSpec {
         id: "small.en",
         label: "Small English",
         filename: "ggml-small.en.bin",
+        revision: "80da2d8",
+        sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        tier: "small",
+        english_only: true,
+        recommended: false,
     },
     ModelSpec {
         id: "medium.en",
         label: "Medium English",
         filename: "ggml-medium.en.bin",
+        revision: "80da2d8",
+        sha256: "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+        tier: "medium",
+        english_only: true,
+        recommended: false,
     },
     ModelSpec {
         id: "tiny",
         label: "Tiny Multilingual",
         filename: "ggml-tiny.bin",
+        revision: "80da2d8",
+        sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+        tier: "tiny",
+        english_only: false,
+        recommended: false,
     },
     ModelSpec {
         id: "base",
         label: "Base Multilingual",
         filename: "ggml-base.bin",
+        revision: "80da2d8",
+        sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+        tier: "base",
+        english_only: false,
+        recommended: false,
     },
     ModelSpec {
         id: "small",
         label: "Small Multilingual",
         filename: "ggml-small.bin",
+        revision: "80da2d8",
+        sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+        tier: "small",
+        english_only: false,
+        recommended: false,
     },
     ModelSpec {
         id: "medium",
         label: "Medium Multilingual",
         filename: "ggml-medium.bin",
+        revision: "80da2d8",
+        sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+        tier: "medium",
+        english_only: false,
+        recommended: false,
     },
     ModelSpec {
         id: "large-v3",
         label: "Large v3 Multilingual",
         filename: "ggml-large-v3.bin",
+        revision: "362722b",
+        sha256: "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
+        tier: "large-v3",
+        english_only: false,
+        recommended: false,
     },
     ModelSpec {
         id: "large-v3-turbo",
         label: "Large v3 Turbo Multilingual",
         filename: "ggml-large-v3-turbo.bin",
+        revision: "98aa99a",
+        sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+        tier: "large-v3-turbo",
+        english_only: false,
+        recommended: false,
     },
 ];
 
@@ -92,14 +167,38 @@ impl Default for TranscriptionSettings {
 
 impl TranscriptionSettings {
     fn path() -> Result<PathBuf, String> {
-        Ok(data_root()?.join("transcription_settings.json"))
+        Ok(crate::app_data_root()?.join("transcription_settings.json"))
     }
 
     pub fn load() -> Self {
-        Self::path()
-            .ok()
-            .and_then(|path| Self::load_from_path(&path).ok())
-            .filter(|settings| model_spec(&settings.model).is_some())
+        let Some(active_path) = Self::path().ok() else {
+            return Self::default();
+        };
+        if crate::paths::path_exists_no_follow(&active_path) {
+            return if crate::paths::regular_file_exists_no_follow(&active_path) {
+                Self::load_from_path(&active_path)
+                    .ok()
+                    .filter(|settings| model_spec(&settings.model).is_some())
+                    .unwrap_or_default()
+            } else {
+                Self::default()
+            };
+        }
+
+        crate::paths::app_data_file_candidates("transcription_settings.json")
+            .unwrap_or_default()
+            .into_iter()
+            .skip(1)
+            .find_map(|path| {
+                if !crate::paths::regular_file_exists_no_follow(&path) {
+                    return None;
+                }
+                let settings = Self::load_from_path(&path)
+                    .ok()
+                    .filter(|settings| model_spec(&settings.model).is_some())?;
+                let _ = settings.save();
+                Some(settings)
+            })
             .unwrap_or_default()
     }
 
@@ -132,8 +231,14 @@ pub struct LocalModelInfo {
     pub id: String,
     pub label: String,
     pub filename: String,
+    pub revision: String,
+    pub sha256: String,
+    pub tier: String,
+    pub english_only: bool,
+    pub recommended: bool,
     pub path: String,
     pub downloaded: bool,
+    pub installed_bytes: Option<u64>,
     pub selected: bool,
 }
 
@@ -277,10 +382,9 @@ impl TranscriptionService {
 
     pub fn list_models(&self) -> Result<Vec<LocalModelInfo>, String> {
         let selected = self.settings().model;
-        let dir = models_dir()?;
         Ok(MODELS
             .iter()
-            .map(|spec| model_info(spec, &dir, &selected))
+            .map(|spec| model_info(spec, &selected))
             .collect())
     }
 
@@ -353,8 +457,8 @@ impl TranscriptionService {
             "is not installed"
         };
         Err(format!(
-            "Local transcription model '{}' {action}. Open Settings -> System and download a model before dictating.",
-            status.model
+            "Local transcription model '{}' {action}. Run `origin model download {}` and `origin model use {}` before dictating.",
+            status.model, status.model, status.model
         ))
     }
 
@@ -398,9 +502,9 @@ impl TranscriptionService {
         let destination = dir.join(spec.filename);
         let selected = self.settings().model;
 
-        if validate_model_file(&destination, None).is_ok() {
+        if find_valid_model_path(&spec)?.is_some() {
             self.set_download_runtime(None);
-            return Ok(model_info(&spec, &dir, &selected));
+            return Ok(model_info(&spec, &selected));
         }
 
         self.set_download_runtime(Some(TranscriptionRuntimeStatus {
@@ -435,7 +539,7 @@ impl TranscriptionService {
         match result {
             Ok(()) => {
                 self.clear_download_runtime(spec.id);
-                Ok(model_info(&spec, &dir, &selected))
+                Ok(model_info(&spec, &selected))
             }
             Err(error) => {
                 self.set_download_runtime(Some(TranscriptionRuntimeStatus {
@@ -456,6 +560,28 @@ impl TranscriptionService {
         }
     }
 
+    /// Remove one catalog model from every backend-owned storage root.
+    /// Only the exact catalog filename (and its `.part` download) is touched.
+    /// Symlinks/reparse points are removed as leaf entries and are never followed.
+    pub async fn remove_model(&self, model: &str) -> Result<bool, String> {
+        let _download_guard = self.download_guard.lock().await;
+        let normalized = model.trim();
+        let spec = *model_spec(normalized)
+            .ok_or_else(|| format!("Unknown local transcription model: {normalized}"))?;
+        let roots = crate::model_storage_roots()?;
+        let removed_any = remove_model_from_roots(&spec, &roots)?;
+        if removed_any {
+            if let Ok(mut loaded) = self.loaded.lock() {
+                if loaded.as_ref().is_some_and(|loaded| loaded.id == spec.id) {
+                    *loaded = None;
+                }
+            }
+            self.set_runtime(self.status_for_model(normalized, None));
+        }
+        self.clear_download_runtime(spec.id);
+        Ok(removed_any)
+    }
+
     /// Load the selected local Whisper model into memory without running inference.
     /// This is safe to call repeatedly and is intentionally run off the UI thread so
     /// the first short dictation does not pay the full model-open cost after release.
@@ -463,9 +589,8 @@ impl TranscriptionService {
         let model = self.settings().model;
         let spec = *model_spec(&model)
             .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
-        let path = models_dir()?.join(spec.filename);
-        validate_model_file(&path, None).map_err(|error| {
-            format!("Local model '{model}' is not installed or is invalid: {error}")
+        let path = find_valid_model_path(&spec)?.ok_or_else(|| {
+            format!("Local model '{model}' is not installed or is invalid. Download it before dictating.")
         })?;
 
         let mut loading_status = self.status_for_model(&model, None);
@@ -503,7 +628,7 @@ impl TranscriptionService {
         );
         #[cfg(debug_assertions)]
         eprintln!(
-            "[ListenOS timing] model_preload model={} elapsed_ms={}",
+            "[Origin Speak timing] model_preload model={} elapsed_ms={}",
             model,
             started.elapsed().as_millis()
         );
@@ -521,9 +646,8 @@ impl TranscriptionService {
         validate_model_language(&model, language.as_deref())?;
         let spec = *model_spec(&model)
             .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
-        let path = models_dir()?.join(spec.filename);
-        validate_model_file(&path, None).map_err(|error| {
-            format!("Local model '{model}' is not installed or is invalid: {error}. Download it before dictating.")
+        let path = find_valid_model_path(&spec)?.ok_or_else(|| {
+            format!("Local model '{model}' is not installed or is invalid. Download it before dictating.")
         })?;
 
         let mut transcribing_status = self.status_for_model(&model, None);
@@ -627,7 +751,7 @@ impl TranscriptionService {
             );
             #[cfg(debug_assertions)]
             eprintln!(
-                "[ListenOS timing] transcription model={} audio_ms={} resample_ms={} model_load_ms={} inference_ms={} total_ms={} text_chars={}",
+                "[Origin Speak timing] transcription model={} audio_ms={} resample_ms={} model_load_ms={} inference_ms={} total_ms={} text_chars={}",
                 model_for_task,
                 (audio.len() as u64 * 1000) / WHISPER_SAMPLE_RATE as u64,
                 resample_ms,
@@ -709,7 +833,7 @@ fn validate_model_language(model: &str, language: Option<&str>) -> Result<(), St
 
     let multilingual = model.trim_end_matches(".en");
     Err(format!(
-        "Local model '{model}' is English-only and cannot transcribe source language '{language}'. Select or download the multilingual '{multilingual}' model in Settings -> System."
+        "Local model '{model}' is English-only and cannot transcribe source language '{language}'. Run `origin model download {multilingual}` and `origin model use {multilingual}`."
     ))
 }
 
@@ -722,28 +846,79 @@ fn cpu_thread_count() -> i32 {
         .unwrap_or(4)
 }
 
-fn data_root() -> Result<PathBuf, String> {
-    let data_dir =
-        dirs_next::data_dir().ok_or_else(|| "Could not find data directory".to_string())?;
-    Ok(data_dir.join("ListenOS"))
-}
-
 pub fn models_dir() -> Result<PathBuf, String> {
-    Ok(data_root()?.join("models"))
+    crate::model_storage_roots()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Could not determine local model directory".to_string())
 }
 
 fn model_spec(id: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|spec| spec.id == id)
 }
 
-fn model_info(spec: &ModelSpec, dir: &Path, selected: &str) -> LocalModelInfo {
-    let path = dir.join(spec.filename);
+fn find_valid_model_path_in_roots(spec: &ModelSpec, roots: &[PathBuf]) -> Option<PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.join(spec.filename))
+        .find(|path| validate_model_integrity(path, spec, None).is_ok())
+}
+
+fn find_valid_model_path(spec: &ModelSpec) -> Result<Option<PathBuf>, String> {
+    let roots = crate::model_storage_roots()?;
+    Ok(find_valid_model_path_in_roots(spec, &roots))
+}
+
+/// Fast readiness/discovery check used on the resident startup path.
+///
+/// Full SHA-256 verification remains mandatory before a downloaded model is
+/// installed and before a model is loaded into Whisper. Startup/status calls
+/// only need to know whether a plausible app-owned model is present; hashing a
+/// multi-gigabyte file synchronously here would delay shortcut registration at
+/// login and recreate the cold-start stall this runtime is designed to avoid.
+fn find_usable_model_path_in_roots(spec: &ModelSpec, roots: &[PathBuf]) -> Option<PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.join(spec.filename))
+        .find(|path| validate_model_file(path, None).is_ok())
+}
+
+fn find_usable_model_path(spec: &ModelSpec) -> Result<Option<PathBuf>, String> {
+    let roots = crate::model_storage_roots()?;
+    let legacy_roots = crate::legacy_model_storage_roots()?;
+    let active_roots = roots
+        .into_iter()
+        .filter(|root| !legacy_roots.contains(root))
+        .collect::<Vec<_>>();
+    if let Some(path) = find_usable_model_path_in_roots(spec, &active_roots) {
+        return Ok(Some(path));
+    }
+    Ok(find_valid_model_path_in_roots(spec, &legacy_roots))
+}
+
+fn model_info(spec: &ModelSpec, selected: &str) -> LocalModelInfo {
+    let valid_path = find_usable_model_path(spec).ok().flatten();
+    let path = valid_path.clone().unwrap_or_else(|| {
+        models_dir()
+            .unwrap_or_else(|_| PathBuf::from("models"))
+            .join(spec.filename)
+    });
+    let installed_bytes = valid_path
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
     LocalModelInfo {
         id: spec.id.to_string(),
         label: spec.label.to_string(),
         filename: spec.filename.to_string(),
+        revision: spec.revision.to_string(),
+        sha256: spec.sha256.to_string(),
+        tier: spec.tier.to_string(),
+        english_only: spec.english_only,
+        recommended: spec.recommended,
         path: path.to_string_lossy().to_string(),
-        downloaded: validate_model_file(&path, None).is_ok(),
+        downloaded: valid_path.is_some(),
+        installed_bytes,
         selected: selected == spec.id,
     }
 }
@@ -931,12 +1106,12 @@ fn status_for_model(
     gpu_requested: bool,
     loaded_backend: Option<&BackendSelection>,
 ) -> TranscriptionRuntimeStatus {
-    let path =
-        model_spec(model).and_then(|spec| models_dir().ok().map(|dir| dir.join(spec.filename)));
-    let downloaded = path
-        .as_ref()
-        .map(|path| validate_model_file(path, None).is_ok())
-        .unwrap_or(false);
+    let (path, downloaded) = model_spec(model)
+        .map(|spec| match find_usable_model_path(spec).ok().flatten() {
+            Some(path) => (Some(path), true),
+            None => (models_dir().ok().map(|dir| dir.join(spec.filename)), false),
+        })
+        .unwrap_or((None, false));
     let planned_backend = select_backend(gpu_requested);
     let active_backend = loaded_backend.map(|backend| backend.active);
     let accelerator = loaded_backend
@@ -970,21 +1145,41 @@ fn status_for_model(
 
 fn model_url(spec: &ModelSpec) -> String {
     format!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-        spec.filename
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/{}/{}",
+        spec.revision, spec.filename
     )
 }
 
-// Adapted from VoxType's atomic Whisper model download validation:
-// https://github.com/peteonrails/voxtype/blob/320a737/src/setup/model.rs
-// Whisper.cpp does not publish a checksum manifest for these files, so the
-// response length and ggml container magic are the available integrity checks.
+// Structural checks are intentionally separate from the catalog trust check.
+// Every supported artifact is pinned above to an immutable revision and a
+// verified SHA-256; both discovery and download installation require that hash.
 fn validate_model_file(path: &Path, expected_len: Option<u64>) -> Result<(), String> {
-    let len = std::fs::metadata(path)
-        .map_err(|error| format!("could not stat model: {error}"))?
-        .len();
-    if len == 0 {
-        return Err("model file is empty".to_string());
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not stat model: {error}"))?;
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+    if metadata.file_type().is_symlink() || is_reparse_point {
+        return Err("model path must not be a symbolic link or reparse point".to_string());
+    }
+    if !metadata.is_file() {
+        return Err("model path is not a regular file".to_string());
+    }
+    let len = metadata.len();
+    if len < MIN_MODEL_FILE_BYTES {
+        return Err(format!(
+            "model file is implausibly small: {len} bytes (minimum {MIN_MODEL_FILE_BYTES})"
+        ));
+    }
+    if len > MAX_MODEL_FILE_BYTES {
+        return Err(format!(
+            "model file is implausibly large: {len} bytes (maximum {MAX_MODEL_FILE_BYTES})"
+        ));
     }
     if let Some(expected) = expected_len {
         if len != expected {
@@ -1002,6 +1197,281 @@ fn validate_model_file(path: &Path, expected_len: Option<u64>) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    if let Ok(mut counts) = SHA256_FILE_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        *counts.entry(path.to_path_buf()).or_default() += 1;
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("could not open model for hashing: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not hash model file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+fn sha256_file_call_count(path: &Path) -> usize {
+    SHA256_FILE_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|counts| counts.get(path).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn reset_sha256_file_call_count(path: &Path) {
+    if let Ok(mut counts) = SHA256_FILE_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        counts.remove(path);
+    }
+}
+
+fn verified_model_identity(path: &Path, spec: &ModelSpec) -> Result<VerifiedModelIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not stat model for verification cache: {error}"))?;
+    Ok(VerifiedModelIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        expected_sha256: spec.sha256,
+    })
+}
+
+fn verification_cache() -> &'static Mutex<HashMap<PathBuf, VerifiedModelIdentity>> {
+    VERIFIED_MODELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn verification_cache_matches(path: &Path, identity: &VerifiedModelIdentity) -> bool {
+    verification_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
+        .is_some_and(|cached| cached == *identity)
+}
+
+fn evict_verified_model(path: &Path) {
+    if let Ok(mut cache) = verification_cache().lock() {
+        cache.remove(path);
+    }
+}
+
+fn validate_model_integrity(
+    path: &Path,
+    spec: &ModelSpec,
+    expected_len: Option<u64>,
+) -> Result<(), String> {
+    validate_model_file(path, expected_len)?;
+    let before = verified_model_identity(path, spec)?;
+    if verification_cache_matches(path, &before) {
+        return Ok(());
+    }
+
+    let actual = sha256_file(path)?;
+    if !actual.eq_ignore_ascii_case(spec.sha256) {
+        return Err(format!(
+            "sha256 mismatch for '{}': expected {}, got {}",
+            spec.id, spec.sha256, actual
+        ));
+    }
+
+    let after = verified_model_identity(path, spec)?;
+    if before != after {
+        return Err(format!(
+            "model '{}' changed while its integrity was being verified",
+            spec.id
+        ));
+    }
+    if let Ok(mut cache) = verification_cache().lock() {
+        cache.insert(path.to_path_buf(), after);
+    }
+    Ok(())
+}
+
+fn remove_model_leaf_no_follow(path: &Path) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect model path {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+
+    evict_verified_model(path);
+    if metadata.file_type().is_symlink() || is_reparse_point {
+        let result = if metadata.is_dir() {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        return result
+            .map(|_| true)
+            .map_err(|error| format!("failed to remove model link {}: {error}", path.display()));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to remove non-file model path {}",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(path)
+        .map(|_| true)
+        .map_err(|error| format!("failed to remove model {}: {error}", path.display()))
+}
+
+fn remove_model_from_roots(spec: &ModelSpec, roots: &[PathBuf]) -> Result<bool, String> {
+    let mut removed_any = false;
+    for root in roots {
+        for path in [
+            root.join(spec.filename),
+            root.join(spec.filename).with_extension("bin.part"),
+        ] {
+            removed_any |= remove_model_leaf_no_follow(&path)?;
+        }
+    }
+    Ok(removed_any)
+}
+
+fn partial_download_len(path: &Path) -> Result<u64, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect partial model {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+
+    if metadata.file_type().is_symlink() || is_reparse_point || !metadata.is_file() {
+        remove_model_leaf_no_follow(path)?;
+        return Ok(0);
+    }
+    if metadata.len() > MAX_MODEL_FILE_BYTES {
+        remove_model_leaf_no_follow(path)?;
+        return Ok(0);
+    }
+
+    if metadata.len() >= GGML_MAGIC.len() as u64 {
+        let mut magic = [0_u8; 4];
+        std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .map_err(|error| format!("could not inspect partial model header: {error}"))?;
+        if magic != GGML_MAGIC {
+            remove_model_leaf_no_follow(path)?;
+            return Ok(0);
+        }
+    }
+    Ok(metadata.len())
+}
+
+fn parse_content_range_total(value: &str, expected_start: u64) -> Result<Option<u64>, String> {
+    let value = value
+        .trim()
+        .strip_prefix("bytes ")
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let (range, total) = value
+        .split_once('/')
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range start: {value}"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range end: {value}"))?;
+    if start != expected_start || end < start {
+        return Err(format!(
+            "unexpected Content-Range '{value}' for resume offset {expected_start}"
+        ));
+    }
+    if total == "*" {
+        return Ok(None);
+    }
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range total: {value}"))?;
+    if end >= total {
+        return Err(format!("invalid Content-Range total: {value}"));
+    }
+    validate_declared_model_size(total)?;
+    Ok(Some(total))
+}
+
+fn validate_declared_model_size(size: u64) -> Result<(), String> {
+    if !(MIN_MODEL_FILE_BYTES..=MAX_MODEL_FILE_BYTES).contains(&size) {
+        return Err(format!(
+            "Model download declared an invalid size of {size} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn download_response_plan(
+    status: StatusCode,
+    requested_offset: u64,
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+) -> Result<(bool, u64, Option<u64>), String> {
+    if requested_offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+        let content_range =
+            content_range.ok_or_else(|| "Resume response was missing Content-Range".to_string())?;
+        let total = parse_content_range_total(content_range, requested_offset)?;
+        return Ok((true, requested_offset, total));
+    }
+
+    if status == StatusCode::PARTIAL_CONTENT {
+        let content_range = content_range
+            .ok_or_else(|| "Partial response was missing Content-Range".to_string())?;
+        let total = parse_content_range_total(content_range, 0)?;
+        return Ok((false, 0, total));
+    }
+
+    if let Some(total) = content_length {
+        validate_declared_model_size(total)?;
+    }
+    // A 200 response to a Range request means the origin ignored Range. The
+    // caller must truncate and restart from byte 0 rather than append.
+    Ok((false, 0, content_length))
 }
 
 fn load_model(
@@ -1075,7 +1545,7 @@ fn load_model(
     );
     #[cfg(debug_assertions)]
     eprintln!(
-        "[ListenOS backend] model={} gpu_requested={} active={:?} accelerator={} fallback={}",
+        "[Origin Speak backend] model={} gpu_requested={} active={:?} accelerator={} fallback={}",
         model,
         gpu_requested,
         backend.active,
@@ -1225,40 +1695,106 @@ where
     F: FnMut(u64, Option<u64>),
 {
     let url = model_url(spec);
-    let response = reqwest::Client::new()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|error| format!("Failed to download local model '{}': {error}", spec.id))?;
+    let part = destination.with_extension("bin.part");
+    if validate_model_integrity(&part, spec, None).is_ok() {
+        remove_model_leaf_no_follow(destination)?;
+        return tokio::fs::rename(&part, destination)
+            .await
+            .map_err(|error| format!("Failed to install completed local model: {error}"));
+    }
+
+    let client = reqwest::Client::new();
+    let mut resume_offset = partial_download_len(&part)?;
+    let response = loop {
+        let mut request = client.get(&url);
+        if resume_offset > 0 {
+            request = request.header(RANGE, format!("bytes={resume_offset}-"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("Failed to download local model '{}': {error}", spec.id))?;
+
+        if resume_offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            // A stale/oversized partial cannot be resumed against this immutable
+            // artifact. Remove only the partial leaf and retry once from byte 0.
+            remove_model_leaf_no_follow(&part)?;
+            resume_offset = 0;
+            continue;
+        }
+        break response;
+    };
+
     if !response.status().is_success() {
         return Err(format!(
             "Model download failed with HTTP {}",
             response.status()
         ));
     }
-    let expected_len = response.content_length();
-    on_progress(0, expected_len);
-    let part = destination.with_extension("bin.part");
-    let _ = tokio::fs::remove_file(&part).await;
-    let mut file = tokio::fs::File::create(&part)
+
+    let content_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let (append, start_offset, expected_total) = download_response_plan(
+        response.status(),
+        resume_offset,
+        content_range,
+        response.content_length(),
+    )?;
+
+    on_progress(start_offset, expected_total);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true);
+    if append {
+        options.append(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    let mut file = options
+        .open(&part)
         .await
-        .map_err(|error| format!("Failed to create model download file: {error}"))?;
+        .map_err(|error| format!("Failed to open model download file: {error}"))?;
     let mut stream = response.bytes_stream();
-    let mut downloaded = 0_u64;
+    let mut downloaded = start_offset;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("Model download interrupted: {error}"))?;
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("Failed to write model download: {error}"))?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
-        on_progress(downloaded, expected_len);
+        if downloaded > MAX_MODEL_FILE_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(format!(
+                "Model download exceeded the {MAX_MODEL_FILE_BYTES}-byte safety limit"
+            ));
+        }
+        on_progress(downloaded, expected_total);
     }
     file.flush()
         .await
         .map_err(|error| format!("Failed to flush model download: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("Failed to sync model download: {error}"))?;
     drop(file);
 
-    if let Err(error) = validate_model_file(&part, expected_len) {
+    if let Some(expected_total) = expected_total {
+        if downloaded != expected_total {
+            return Err(format!(
+                "Model download interrupted: received {downloaded} of {expected_total} bytes; partial file retained for resume"
+            ));
+        }
+    }
+
+    if downloaded < MIN_MODEL_FILE_BYTES {
+        return Err(format!(
+            "Model download incomplete: only {downloaded} bytes received; partial file retained for resume"
+        ));
+    }
+
+    if let Err(error) = validate_model_integrity(&part, spec, expected_total) {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(format!(
             "Downloaded model '{}' is invalid: {error}",
@@ -1266,11 +1802,7 @@ where
         ));
     }
 
-    if destination.exists() {
-        tokio::fs::remove_file(destination)
-            .await
-            .map_err(|error| format!("Failed to replace invalid local model: {error}"))?;
-    }
+    remove_model_leaf_no_follow(destination)?;
     tokio::fs::rename(&part, destination)
         .await
         .map_err(|error| format!("Failed to install downloaded local model: {error}"))
@@ -1281,7 +1813,7 @@ mod tests {
     use super::*;
 
     fn temp_file(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("listenos-{name}-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("origin-speak-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -1308,9 +1840,15 @@ mod tests {
     #[test]
     fn ggml_validation_rejects_truncated_and_non_model_files() {
         let valid = temp_file("valid-model.bin");
-        std::fs::write(&valid, [b'l', b'm', b'g', b'g', 1, 2, 3, 4]).unwrap();
-        validate_model_file(&valid, Some(8)).expect("valid model header");
-        assert!(validate_model_file(&valid, Some(9)).is_err());
+        let mut file = std::fs::File::create(&valid).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        validate_model_file(&valid, Some(MIN_MODEL_FILE_BYTES)).expect("valid model header");
+        assert!(validate_model_file(&valid, Some(MIN_MODEL_FILE_BYTES + 1)).is_err());
 
         let html = temp_file("html-model.bin");
         std::fs::write(&html, b"<html>error</html>").unwrap();
@@ -1321,11 +1859,289 @@ mod tests {
     }
 
     #[test]
+    fn catalog_exposes_dictation_selection_metadata() {
+        let base = model_spec("base.en").unwrap();
+        assert_eq!(base.tier, "base");
+        assert!(base.english_only);
+        assert!(base.recommended);
+        assert!(!model_spec("base").unwrap().english_only);
+    }
+
+    #[test]
+    fn catalog_pins_verified_revisions_and_sha256_digests() {
+        let expected = [
+            (
+                "tiny",
+                "80da2d8",
+                "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+            ),
+            (
+                "tiny.en",
+                "80da2d8",
+                "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+            ),
+            (
+                "base",
+                "80da2d8",
+                "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+            ),
+            (
+                "base.en",
+                "80da2d8",
+                "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+            ),
+            (
+                "small",
+                "80da2d8",
+                "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+            ),
+            (
+                "small.en",
+                "80da2d8",
+                "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+            ),
+            (
+                "medium",
+                "80da2d8",
+                "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+            ),
+            (
+                "medium.en",
+                "80da2d8",
+                "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+            ),
+            (
+                "large-v3",
+                "362722b",
+                "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
+            ),
+            (
+                "large-v3-turbo",
+                "98aa99a",
+                "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+            ),
+        ];
+        for (id, revision, sha256) in expected {
+            let spec = model_spec(id).expect("catalog model");
+            assert_eq!(spec.revision, revision, "revision mismatch for {id}");
+            assert_eq!(spec.sha256, sha256, "sha256 mismatch for {id}");
+        }
+    }
+
+    #[test]
+    fn legacy_model_discovery_prefers_current_then_legacy_without_parent_deletion() {
+        let root = temp_file("model-roots");
+        let current = root.join("current");
+        let legacy = root.join("legacy");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let catalog_spec = model_spec("tiny.en").unwrap();
+        let legacy_model = legacy.join(catalog_spec.filename);
+        let mut file = std::fs::File::create(&legacy_model).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+
+        let sha256: &'static str = Box::leak(sha256_file(&legacy_model).unwrap().into_boxed_str());
+        let spec = ModelSpec {
+            sha256,
+            ..*catalog_spec
+        };
+
+        assert_eq!(
+            find_valid_model_path_in_roots(&spec, &[current.clone(), legacy.clone()]),
+            Some(legacy_model.clone())
+        );
+
+        std::fs::remove_file(legacy_model).unwrap();
+        std::fs::remove_dir(legacy).unwrap();
+        std::fs::remove_dir(current).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn model_removal_cleans_current_and_legacy_roots_without_deleting_parents() {
+        let root = temp_file("model-remove");
+        let current = root.join("current");
+        let legacy = root.join("legacy");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let spec = model_spec("base.en").unwrap();
+        let current_model = current.join(spec.filename);
+        let legacy_model = legacy.join(spec.filename);
+        let current_part = current_model.with_extension("bin.part");
+        let legacy_part = legacy_model.with_extension("bin.part");
+        let current_sibling = current.join("keep.txt");
+        let legacy_sibling = legacy.join("keep.txt");
+        for path in [&current_model, &legacy_model, &current_part, &legacy_part] {
+            std::fs::write(path, b"temporary").unwrap();
+        }
+        std::fs::write(&current_sibling, b"keep").unwrap();
+        std::fs::write(&legacy_sibling, b"keep").unwrap();
+
+        assert!(remove_model_from_roots(spec, &[current.clone(), legacy.clone()]).unwrap());
+        for path in [&current_model, &legacy_model, &current_part, &legacy_part] {
+            assert!(!path.exists());
+        }
+        assert!(current_sibling.exists());
+        assert!(legacy_sibling.exists());
+        assert!(current.exists());
+        assert!(legacy.exists());
+
+        std::fs::remove_file(current_sibling).unwrap();
+        std::fs::remove_file(legacy_sibling).unwrap();
+        std::fs::remove_dir(current).unwrap();
+        std::fs::remove_dir(legacy).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn model_urls_point_to_whisper_cpp_artifacts() {
         let spec = model_spec("base.en").unwrap();
         let url = model_url(spec);
         assert!(url.ends_with("/ggml-base.en.bin"));
         assert!(url.contains("huggingface.co/ggerganov/whisper.cpp"));
+        assert!(url.contains("/resolve/80da2d8/"));
+    }
+
+    #[test]
+    fn sha256_helper_matches_known_vector_and_integrity_rejects_wrong_digest() {
+        let small = temp_file("sha256-vector");
+        std::fs::write(&small, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&small).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_file(small).unwrap();
+
+        let model = temp_file("wrong-digest.bin");
+        let mut file = std::fs::File::create(&model).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        let error = validate_model_integrity(&model, model_spec("base.en").unwrap(), None)
+            .expect_err("wrong digest must not be trusted");
+        assert!(error.contains("sha256 mismatch"));
+        std::fs::remove_file(model).unwrap();
+    }
+
+    #[test]
+    fn verified_model_cache_avoids_rehash_and_invalidates_on_identity_changes() {
+        let model = temp_file("verified-cache.bin");
+        let mut file = std::fs::File::create(&model).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+
+        let digest: &'static str = Box::leak(sha256_file(&model).unwrap().into_boxed_str());
+        let spec = ModelSpec {
+            sha256: digest,
+            ..*model_spec("base.en").unwrap()
+        };
+        evict_verified_model(&model);
+        reset_sha256_file_call_count(&model);
+
+        validate_model_integrity(&model, &spec, None).expect("first verification");
+        assert_eq!(sha256_file_call_count(&model), 1);
+        validate_model_integrity(&model, &spec, None).expect("cached verification");
+        assert_eq!(
+            sha256_file_call_count(&model),
+            1,
+            "unchanged metadata and spec must not rehash"
+        );
+
+        let base_identity = verified_model_identity(&model, &spec).unwrap();
+        let different_size = VerifiedModelIdentity {
+            len: base_identity.len + 1,
+            ..base_identity.clone()
+        };
+        let different_mtime = VerifiedModelIdentity {
+            modified: Some(SystemTime::UNIX_EPOCH),
+            ..base_identity.clone()
+        };
+        let different_spec = VerifiedModelIdentity {
+            expected_sha256: model_spec("small.en").unwrap().sha256,
+            ..base_identity.clone()
+        };
+        assert!(verification_cache_matches(&model, &base_identity));
+        assert!(!verification_cache_matches(&model, &different_size));
+        assert!(!verification_cache_matches(&model, &different_mtime));
+        assert!(!verification_cache_matches(&model, &different_spec));
+
+        evict_verified_model(&model);
+        std::fs::remove_file(model).unwrap();
+    }
+
+    #[test]
+    fn startup_model_discovery_never_hashes_the_model_file() {
+        let root = temp_file("startup-discovery-root");
+        let _ = std::fs::remove_file(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let spec = *model_spec("base.en").unwrap();
+        let model = root.join(spec.filename);
+        let mut file = std::fs::File::create(&model).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        file.write_all(&GGML_MAGIC).unwrap();
+        file.seek(SeekFrom::Start(MIN_MODEL_FILE_BYTES - 1))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+
+        reset_sha256_file_call_count(&model);
+        assert_eq!(
+            find_usable_model_path_in_roots(&spec, std::slice::from_ref(&root)),
+            Some(model.clone())
+        );
+        assert_eq!(
+            sha256_file_call_count(&model),
+            0,
+            "resident startup/status discovery must stay metadata/header-only"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_plan_appends_only_for_matching_partial_content() {
+        let offset = MIN_MODEL_FILE_BYTES;
+        let total = MIN_MODEL_FILE_BYTES * 3;
+        let range = format!("bytes {offset}-{}/{total}", total - 1);
+        let plan = download_response_plan(
+            StatusCode::PARTIAL_CONTENT,
+            offset,
+            Some(&range),
+            Some(total - offset),
+        )
+        .unwrap();
+        assert_eq!(plan, (true, offset, Some(total)));
+
+        let restarted = download_response_plan(StatusCode::OK, offset, None, Some(total)).unwrap();
+        assert_eq!(restarted, (false, 0, Some(total)));
+        assert!(download_response_plan(
+            StatusCode::PARTIAL_CONTENT,
+            offset,
+            Some("bytes 0-1048575/3145728"),
+            Some(MIN_MODEL_FILE_BYTES),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn valid_partial_file_is_retained_for_resume() {
+        let part = temp_file("resume.bin.part");
+        std::fs::write(&part, [b'l', b'm', b'g', b'g', 1, 2, 3, 4]).unwrap();
+        assert_eq!(partial_download_len(&part).unwrap(), 8);
+        assert!(part.exists());
+        std::fs::remove_file(part).unwrap();
     }
 
     #[test]
@@ -1338,7 +2154,8 @@ mod tests {
         let error = validate_model_language("base.en", Some("hi"))
             .expect_err("English-only model must reject Hindi");
         assert!(error.contains("English-only"));
-        assert!(error.contains("multilingual 'base'"));
+        assert!(error.contains("origin model download base"));
+        assert!(error.contains("origin model use base"));
     }
 
     #[test]

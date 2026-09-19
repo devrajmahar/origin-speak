@@ -1,8 +1,36 @@
 # Third-Party Notices
 
+## Hugeicons
+
+Origin Speak vendors selected SVG icons from the Hugeicons free icon set for the native GPUI interface.
+
+- Project: Hugeicons
+- Source: https://github.com/hugeicons/hugeicons
+- License: MIT
+
+Copyright (c) Hugeicons
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## VoxType
 
-Portions of ListenOS are derived from or adapted from VoxType.
+Portions of Origin Speak are derived from or adapted from VoxType.
 
 - Project: VoxType
 - Source: https://github.com/peteonrails/voxtype
@@ -34,7 +62,7 @@ SOFTWARE.
 
 ## Rubato
 
-ListenOS uses Rubato 0.16.x for band-limited audio sample-rate conversion.
+Origin Speak uses Rubato 0.16.x for band-limited audio sample-rate conversion.
 
 - Project: Rubato
 - Source: https://github.com/HEnquist/rubato
@@ -65,9 +93,9 @@ SOFTWARE.
 
 ## whisper.cpp
 
-ListenOS uses whisper.cpp through `whisper-rs` for local speech-to-text inference.
+Origin Speak uses whisper.cpp through `whisper-rs` for local speech-to-text inference.
 The notice below is the license bundled by `whisper-rs-sys` 0.15.0 with the
-whisper.cpp source that is compiled into ListenOS.
+whisper.cpp source that is compiled into Origin Speak.
 
 - Project: whisper.cpp
 - Source: https://github.com/ggml-org/whisper.cpp
@@ -98,7 +126,7 @@ SOFTWARE.
 
 ## whisper-rs
 
-ListenOS uses `whisper-rs` 0.16.x and `whisper-rs-sys` 0.15.x as Rust bindings
+Origin Speak uses `whisper-rs` 0.16.x and `whisper-rs-sys` 0.15.x as Rust bindings
 for whisper.cpp. These binding crates are dedicated to the public domain under
 the Unlicense.
 
@@ -108,7 +136,7 @@ the Unlicense.
 
 ## gpui-base
 
-ListenOS uses `gpui-base` 0.6.x as the unstyled behavior and interaction foundation beneath ListenOS-owned native UI components. ListenOS does not use the `gpui-kit` / `gpui-component` styled component layer.
+Origin Speak uses `gpui-base` 0.6.x as the unstyled behavior and interaction foundation beneath Origin Speak-owned native UI components. Origin Speak does not use the `gpui-kit` / `gpui-component` styled component layer.
 
 - Project: gpui-base
 - Source: https://github.com/longbridge/gpui-kit
@@ -117,7 +145,7 @@ ListenOS uses `gpui-base` 0.6.x as the unstyled behavior and interaction foundat
 
 ## GPUI
 
-ListenOS uses GPUI through the `gpui-pre` 0.3.x package for GPU-accelerated native windowing and rendering.
+Origin Speak uses GPUI through the `gpui-pre` 0.3.x package for GPU-accelerated native windowing and rendering.
 
 - Project: GPUI
 - Source: https://github.com/zed-industries/zed
