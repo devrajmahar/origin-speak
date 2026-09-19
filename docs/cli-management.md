@@ -67,7 +67,9 @@ Windows lifecycle control uses native named-object/process primitives and starts
 
 Autostart targets the resident runtime directly. The console manager is invoked only when the user or automation needs a management operation.
 
-Mutating CLI operations persist through the backend typed APIs. If an installed resident runtime is already running, model selection/removal of the active model, microphone selection, dictation-hotkey changes, and config set/reset automatically restart it so the new persisted state takes effect immediately.
+Model management is explicit but compact: `origin model list` shows catalog state, `origin model installed` filters to local models, `origin model install <id>` downloads without changing the default, `origin model use <id>` installs when necessary and then makes that model the default, and `origin model remove <id>` deletes a non-default local model. The older `download` and `select` spellings remain compatibility aliases.
+
+Mutating CLI operations persist through the backend typed APIs. If an installed resident runtime is already running, model switching, microphone selection, dictation-hotkey changes, and config set/reset automatically restart it so the new persisted state takes effect immediately.
 
 ## Updates and release artifacts
 

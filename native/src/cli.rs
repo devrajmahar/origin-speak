@@ -82,6 +82,7 @@ pub enum DictionaryAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelAction {
     List,
+    Installed,
     Status,
     Select(String),
     Download(String),
@@ -252,7 +253,7 @@ fn is_program_name(value: &str) -> bool {
 }
 
 pub fn usage() -> &'static str {
-    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, select, download, or remove local models\n  mic          List, inspect, or select microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Download, verify, and install the latest release\n  upgrade      Alias for 'origin update'\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
+    "Origin Speak CLI\n\nUsage: origin [--json] <command> [options]\n\nCommands:\n  setup        Configure model, microphone, autostart, and resident runtime\n  status       Show runtime and configuration status\n  doctor       Run environment and runtime diagnostics\n  config       Read or change persisted configuration\n  dictionary   Manage speech-recognition words and pronunciations\n  model        List, install, switch, inspect, or remove local models\n  mic          List, inspect, or select microphones\n  hotkey       Show or change the dictation shortcut\n  autostart    Show, enable, or disable login launch preference\n  start        Start the resident voice host\n  stop         Stop the resident voice host\n  restart      Restart the resident voice host\n  update       Download, verify, and install the latest release\n  upgrade      Alias for 'origin update'\n  uninstall    Remove Origin Speak and user data (models included by default)\n  version      Print the installed version\n\nGlobal options:\n  --json       Emit one stable JSON object and no ANSI/progress animation\n  -h, --help   Show this help\n"
 }
 
 pub fn uninstall_requires_confirmation(
@@ -380,13 +381,20 @@ fn parse_model(args: &[String]) -> Result<ModelAction, CliError> {
     match args {
         [] => Ok(ModelAction::List),
         [one] if one == "list" => Ok(ModelAction::List),
+        [one] if one == "installed" => Ok(ModelAction::Installed),
         [one] if one == "status" => Ok(ModelAction::Status),
-        [op, model] if op == "select" => Ok(ModelAction::Select(model.clone())),
-        [op, model] if op == "download" => Ok(ModelAction::Download(model.clone())),
-        [op, model] if op == "remove" => Ok(ModelAction::Remove(model.clone())),
+        [op, model] if op == "select" || op == "use" || op == "switch" => {
+            Ok(ModelAction::Select(model.clone()))
+        }
+        [op, model] if op == "download" || op == "install" => {
+            Ok(ModelAction::Download(model.clone()))
+        }
+        [op, model] if op == "remove" || op == "delete" || op == "uninstall" => {
+            Ok(ModelAction::Remove(model.clone()))
+        }
         _ => Err(error(
             "usage",
-            "usage: origin model [list|status|select <id>|download <id>|remove <id>]",
+            "usage: origin model [list|installed|status|use <id>|install <id>|remove <id>]",
         )),
     }
 }
@@ -591,6 +599,22 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Model(ModelAction::Download("tiny.en".into()))
+        );
+        assert_eq!(
+            parse(["origin", "model", "install", "tiny.en"])
+                .unwrap()
+                .command,
+            Command::Model(ModelAction::Download("tiny.en".into()))
+        );
+        assert_eq!(
+            parse(["origin", "model", "use", "tiny.en"])
+                .unwrap()
+                .command,
+            Command::Model(ModelAction::Select("tiny.en".into()))
+        );
+        assert_eq!(
+            parse(["origin", "model", "installed"]).unwrap().command,
+            Command::Model(ModelAction::Installed)
         );
         assert_eq!(
             parse(["origin", "mic", "list"]).unwrap().command,

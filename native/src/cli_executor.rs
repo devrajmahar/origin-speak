@@ -128,28 +128,35 @@ impl CoreCliExecutor {
         match action {
             ModelAction::List => {
                 let models = list_local_models(State::new(self.state.as_ref())).await?;
-                let selected = get_transcription_settings(State::new(self.state.as_ref()))
-                    .await?
-                    .model;
-                let summary = models
-                    .iter()
-                    .map(|model| {
-                        format!(
-                            "{}{}{}",
-                            model.id,
-                            if model.id == selected { "*" } else { "" },
-                            if model.downloaded {
-                                " (downloaded)"
-                            } else {
-                                ""
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 Ok(
-                    CommandResult::success("models", "Local transcription models")
-                        .field("models", summary),
+                    CommandResult::success("models", "Available transcription models")
+                        .field("models", render_models(&models))
+                        .field(
+                            "installed_count",
+                            models
+                                .iter()
+                                .filter(|model| model.downloaded)
+                                .count()
+                                .to_string(),
+                        ),
+                )
+            }
+            ModelAction::Installed => {
+                let models = list_local_models(State::new(self.state.as_ref())).await?;
+                let installed = models
+                    .iter()
+                    .filter(|model| model.downloaded)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let summary = if installed.is_empty() {
+                    "No transcription models are installed.".to_string()
+                } else {
+                    render_models(&installed)
+                };
+                Ok(
+                    CommandResult::success("installed_models", "Installed transcription models")
+                        .field("models", summary)
+                        .field("installed_count", installed.len().to_string()),
                 )
             }
             ModelAction::Status => {
@@ -180,13 +187,24 @@ impl CoreCliExecutor {
                 let current = get_transcription_settings(State::new(self.state.as_ref()))
                     .await?
                     .model;
+                let models = list_local_models(State::new(self.state.as_ref())).await?;
+                let info = models
+                    .iter()
+                    .find(|entry| entry.id == *model)
+                    .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
+                let installed_now = !info.downloaded;
+                if installed_now {
+                    download_local_model(State::new(self.state.as_ref()), model.clone()).await?;
+                }
                 if current != *model {
                     set_transcription_model(State::new(self.state.as_ref()), model.clone()).await?;
                 }
                 Ok(CommandResult::success(
                     "model_selected",
-                    format!("Selected model {model}"),
-                ))
+                    format!("Model {model} is now the default"),
+                )
+                .field("selected", model)
+                .field("installed_now", installed_now.to_string()))
             }
             ModelAction::Download(model) => {
                 let existing = list_local_models(State::new(self.state.as_ref())).await?;
@@ -210,11 +228,17 @@ impl CoreCliExecutor {
                 ensure_model_removable(&selected, model)?;
                 let removed =
                     delete_local_model(State::new(self.state.as_ref()), model.clone()).await?;
-                Ok(CommandResult::success(
-                    "model_removed",
-                    format!("Model {model} removal complete"),
+                if !removed {
+                    return Ok(CommandResult::success(
+                        "model_not_installed",
+                        format!("Model {model} is not installed"),
+                    )
+                    .field("removed", "false"));
+                }
+                Ok(
+                    CommandResult::success("model_removed", format!("Removed model {model}"))
+                        .field("removed", removed.to_string()),
                 )
-                .field("removed", removed.to_string()))
             }
         }
     }
@@ -479,10 +503,49 @@ fn is_system_default_microphone(value: &str) -> bool {
 fn ensure_model_removable(selected: &str, target: &str) -> Result<(), String> {
     if selected == target {
         return Err(format!(
-            "Cannot remove the currently selected model '{target}'. Select another model first."
+            "Cannot remove the current default model '{target}'. Switch first with origin model use <other-model>, then run origin model remove {target}."
         ));
     }
     Ok(())
+}
+
+fn render_models(models: &[origin_speak_lib::LocalModelInfo]) -> String {
+    models
+        .iter()
+        .map(|model| {
+            let mut states = Vec::new();
+            if model.selected {
+                states.push("default");
+            }
+            if model.downloaded {
+                states.push("installed");
+            }
+            if model.recommended {
+                states.push("recommended");
+            }
+            let state = if states.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", states.join(", "))
+            };
+            let size = model
+                .installed_bytes
+                .map(|bytes| format!(" · {}", format_model_bytes(bytes)))
+                .unwrap_or_default();
+            format!("{}{}{}\n  {}", model.id, state, size, model.label)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_model_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
 }
 
 fn validated_dictionary_text(label: &str, value: &str) -> Result<String, String> {
@@ -562,7 +625,8 @@ mod tests {
     #[test]
     fn selected_model_cannot_be_removed() {
         let error = ensure_model_removable("base.en", "base.en").unwrap_err();
-        assert!(error.contains("Select another model first"));
+        assert!(error.contains("origin model use <other-model>"));
+        assert!(error.contains("origin model remove base.en"));
         assert!(ensure_model_removable("base.en", "tiny.en").is_ok());
     }
 

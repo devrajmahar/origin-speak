@@ -48,9 +48,10 @@ Hold the shortcut, speak, then release it. Origin Speak transcribes locally and 
 | Show status | `origin status` |
 | Run diagnostics | `origin doctor` |
 | List models | `origin model list` |
+| Show installed models only | `origin model installed` |
 | Check selected model / GPU or CPU | `origin model status` |
-| Download a model | `origin model download <id>` |
-| Select a model | `origin model select <id>` |
+| Install a model | `origin model install <id>` |
+| Switch/default to a model | `origin model use <id>` |
 | Remove a model | `origin model remove <id>` |
 | List microphones | `origin mic list` |
 | Show microphone | `origin mic status` |
@@ -76,10 +77,13 @@ A running resident automatically restarts when a changed model, microphone, hotk
 Example:
 
 ```text
-origin model download canary-qwen-2.5b
-origin model select canary-qwen-2.5b
+origin model use canary-qwen-2.5b
 origin model status
 ```
+
+`origin model use <id>` installs the model first when necessary, then makes it the default. You can keep multiple models installed and switch between them at any time. The current default cannot be removed until you switch to another model.
+
+The older `origin model download <id>` and `origin model select <id>` commands remain accepted as compatibility aliases.
 
 Canary-Qwen 2.5B is English-only. Whisper models include English-only and multilingual variants.
 

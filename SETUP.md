@@ -43,9 +43,10 @@ Useful management commands include:
 origin status
 origin doctor
 origin model list
+origin model installed
 origin model status
-origin model download <id>
-origin model select <id>
+origin model install <id>
+origin model use <id>
 origin model remove <id>
 origin mic list
 origin mic status
