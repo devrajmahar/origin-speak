@@ -63,7 +63,21 @@ The plain build uses CPU transcription. `tiny.en` is the lowest-latency English 
 
 ## CLI setup
 
-The manager is the configuration surface. Typical commands are:
+Install from a terminal. There is no GUI installer.
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.ps1 | iex
+```
+
+macOS Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.sh | sh
+```
+
+The bootstrap command downloads the latest GitHub Release manager/runtime pair, verifies both SHA-256 digests against `bootstrap-update.json`, and runs `origin setup`. After installation, `origin` is the configuration surface. Typical commands are:
 
 ```text
 origin setup

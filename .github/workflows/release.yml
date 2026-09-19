@@ -323,6 +323,8 @@ jobs:
             --release-prefix "releases/download/v$VERSION" \
             --artifact-root dist/publish \
             --output dist/publish/bootstrap-update.json
+          cp install.ps1 dist/publish/install.ps1
+          cp install.sh dist/publish/install.sh
 
       - name: Validate CLI/bootstrap update contract
         shell: bash
@@ -356,7 +358,11 @@ jobs:
           cat > dist/release-notes.md <<EOF
           Origin Speak v$VERSION
 
-          Release assets include the origin CLI manager, the origin-runtime resident runtime, platform checksum files, and bootstrap-update.json.
+          Install entirely from the terminal:
+          - Windows PowerShell: `irm https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.ps1 | iex`
+          - macOS Terminal: `curl -fsSL https://raw.githubusercontent.com/devrajmahar/origin-speak/main/install.sh | sh`
+
+          Release assets include the origin CLI manager, the origin-runtime resident runtime, terminal bootstrap scripts, platform checksum files, and bootstrap-update.json.
 
           Trust status:
           - Windows: $WINDOWS_NOTE.
