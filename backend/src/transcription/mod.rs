@@ -987,8 +987,13 @@ fn classify_gpu_log_line(line: &str, evidence: &mut GpuLoadEvidence) {
     }
 }
 
+#[cfg(target_os = "windows")]
+type WhisperLogLevel = i32;
+#[cfg(not(target_os = "windows"))]
+type WhisperLogLevel = u32;
+
 unsafe extern "C" fn whisper_log_capture(
-    _level: i32,
+    _level: WhisperLogLevel,
     text: *const c_char,
     _user_data: *mut c_void,
 ) {

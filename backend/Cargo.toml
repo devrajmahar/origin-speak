@@ -1,6 +1,6 @@
 [package]
 name = "origin-speak-backend"
-version = "0.1.22"
+version = "0.1.23"
 description = "Origin Speak - local voice-to-text dictation engine"
 authors = ["Origin Speak"]
 license = "PROPRIETARY"

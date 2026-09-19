@@ -579,7 +579,16 @@ fn perform_delivery_strategy(strategy: DeliveryStrategy, text: &str) -> Result<(
             let modifiers = [Key::Control, Key::Shift];
             send_hotkey(&mut enigo, &modifiers, Key::Unicode('v'))
         }
-        DeliveryStrategy::ShiftInsert => send_hotkey(&mut enigo, &[Key::Shift], Key::Insert),
+        DeliveryStrategy::ShiftInsert => {
+            #[cfg(target_os = "macos")]
+            {
+                Err("Shift+Insert delivery is not supported on macOS".to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                send_hotkey(&mut enigo, &[Key::Shift], Key::Insert)
+            }
+        }
         DeliveryStrategy::SimulatedTyping => enigo
             .text(text)
             .map_err(|error| format!("Failed to simulate typing: {error}")),

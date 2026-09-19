@@ -310,11 +310,15 @@ pub fn strategy_chain(
             if matches!(process.as_str(), "code" | "cursor" | "windsurf") {
                 vec![DeliveryStrategy::CtrlShiftV, DeliveryStrategy::CtrlV]
             } else {
-                vec![
+                #[cfg(target_os = "macos")]
+                let strategies = vec![DeliveryStrategy::CtrlShiftV, DeliveryStrategy::CtrlV];
+                #[cfg(not(target_os = "macos"))]
+                let strategies = vec![
                     DeliveryStrategy::ShiftInsert,
                     DeliveryStrategy::CtrlShiftV,
                     DeliveryStrategy::CtrlV,
-                ]
+                ];
+                strategies
             }
         }
         TargetSurfaceKind::Browser
