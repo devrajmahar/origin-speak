@@ -81,6 +81,7 @@ pub enum DictionaryAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelAction {
+    Help,
     List,
     Installed,
     Status,
@@ -136,6 +137,11 @@ pub struct CommandResult {
     pub code: &'static str,
     pub message: String,
     pub fields: Vec<(String, String)>,
+    /// Context used only to assemble human output. Never serialized.
+    pub human_fields: Vec<(String, String)>,
+    /// Optional presentation for people. Structured output deliberately ignores
+    /// this value so the JSON contract remains stable and free of terminal UI.
+    pub human_output: Option<String>,
 }
 
 impl CommandResult {
@@ -145,6 +151,8 @@ impl CommandResult {
             code,
             message: message.into(),
             fields: Vec::new(),
+            human_fields: Vec::new(),
+            human_output: None,
         }
     }
 
@@ -153,9 +161,22 @@ impl CommandResult {
         self
     }
 
+    pub fn human(mut self, output: impl Into<String>) -> Self {
+        self.human_output = Some(output.into());
+        self
+    }
+
+    pub fn human_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.human_fields.push((key.into(), value.into()));
+        self
+    }
+
     pub fn render(&self, format: OutputFormat) -> String {
         match format {
             OutputFormat::Human => {
+                if let Some(output) = &self.human_output {
+                    return output.clone();
+                }
                 let mut output = self.message.clone();
                 for (key, value) in &self.fields {
                     output.push('\n');
@@ -192,7 +213,7 @@ impl CommandResult {
 impl CliError {
     pub fn render(&self, format: OutputFormat) -> String {
         match format {
-            OutputFormat::Human => format!("error: {}", self.message),
+            OutputFormat::Human => format!("Origin Speak · Error\n\n{}", self.message),
             OutputFormat::Json => format!(
                 "{{\"ok\":false,\"code\":\"{}\",\"message\":\"{}\"}}",
                 json_escape(self.code),
@@ -380,6 +401,7 @@ fn parse_dictionary(args: &[String]) -> Result<DictionaryAction, CliError> {
 fn parse_model(args: &[String]) -> Result<ModelAction, CliError> {
     match args {
         [] => Ok(ModelAction::List),
+        [one] if matches!(one.as_str(), "help" | "-h" | "--help") => Ok(ModelAction::Help),
         [one] if one == "list" => Ok(ModelAction::List),
         [one] if one == "installed" => Ok(ModelAction::Installed),
         [one] if one == "status" => Ok(ModelAction::Status),
@@ -394,7 +416,7 @@ fn parse_model(args: &[String]) -> Result<ModelAction, CliError> {
         }
         _ => Err(error(
             "usage",
-            "usage: origin model [list|installed|status|use <id>|install <id>|remove <id>]",
+            "usage: origin model [list|installed|status|use <id>|install <id>|remove <id>]\n\nRun 'origin model --help' for examples.",
         )),
     }
 }
@@ -617,6 +639,10 @@ mod tests {
             Command::Model(ModelAction::Installed)
         );
         assert_eq!(
+            parse(["origin", "model", "--help"]).unwrap().command,
+            Command::Model(ModelAction::Help)
+        );
+        assert_eq!(
             parse(["origin", "mic", "list"]).unwrap().command,
             Command::Mic(MicAction::List)
         );
@@ -683,6 +709,8 @@ mod tests {
     fn json_output_is_single_line_and_escaped() {
         let rendered = CommandResult::success("ok", "line\n\"quoted\"")
             .field("path", "a\\b")
+            .human_field("previous", "not serialized")
+            .human("decorative human output")
             .render(OutputFormat::Json);
         assert!(!rendered.contains('\n'));
         assert!(rendered.contains("line\\n\\\"quoted\\\""));
@@ -690,6 +718,8 @@ mod tests {
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["message"], "line\n\"quoted\"");
         assert_eq!(parsed["fields"]["path"], "a\\b");
+        assert!(!rendered.contains("decorative human output"));
+        assert!(!rendered.contains("not serialized"));
 
         let error = CliError {
             code: "bad_input",

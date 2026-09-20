@@ -74,16 +74,49 @@ A running resident automatically restarts when a changed model, microphone, hotk
 
 ## Models
 
-Example:
+Start with the catalog. Row numbers are visual aids only; commands always use the stable model ID from the `MODEL` column.
+
+```text
+Origin Speak · Transcription Models
+
+ #  MODEL               NAME                         SIZE        STATUS
+ ──────────────────────────────────────────────────────────────────────────────
+ 1  tiny.en             Tiny English                 —           Available
+ 2  base.en             Base English                 —           Recommended
+ 3  small.en            Small English                —           Available
+…
+
+Models: 11 available · 0 installed · 1 default
+
+Actions
+  Install or switch model    origin model use <model-id>
+  Install without switching  origin model install <model-id>
+  View installed models      origin model installed
+  View active model / GPU    origin model status
+  Remove installed model     origin model remove <model-id>
+```
+
+Install and switch in one command:
 
 ```text
 origin model use canary-qwen-2.5b
 origin model status
 ```
 
-`origin model use <id>` installs the model first when necessary, then makes it the default. You can keep multiple models installed and switch between them at any time. The current default cannot be removed until you switch to another model.
+`origin model use <id>` validates the ID, installs and verifies the model when necessary, then makes it the default. An already-installed model is not downloaded again, and selecting the current default is a no-op. A running resident restarts only after the selection has been saved. If restart fails, the CLI explains that the model change succeeded and how to retry the runtime.
 
-The older `origin model download <id>` and `origin model select <id>` commands remain accepted as compatibility aliases.
+`origin model install <id>` downloads a model without changing the default. `origin model installed` shows only models occupying storage, their measured file sizes, the default marker, and a total when every size is available.
+
+Remove a model that is no longer the default:
+
+```text
+origin model use large-v3
+origin model remove base.en
+```
+
+Origin Speak never silently changes the default during removal. Attempting to remove the default model is rejected with the exact switch and retry commands. An unknown ID reports close catalog matches; a failed download leaves the prior default unchanged.
+
+Run `origin model --help` for the complete workflow. The older `download`, `select`/`switch`, and `delete`/`uninstall` spellings remain accepted as compatibility aliases.
 
 Canary-Qwen 2.5B is English-only. Whisper models include English-only and multilingual variants.
 
@@ -98,26 +131,28 @@ origin model status
 GPU example:
 
 ```text
-selected: canary-qwen-2.5b
-gpu_preference: enabled
-compute: GPU
-compute_status: ready
-accelerator: NVIDIA GeForce RTX 4080
+Origin Speak · Model Status
+
+Default model    canary-qwen-2.5b
+Installed        Yes
+GPU preference   enabled
+Active compute   GPU
+Accelerator      NVIDIA GeForce RTX 4080
 ```
 
 CPU fallback example:
 
 ```text
-compute: CPU
-compute_fallback: <reason>
+Active compute   CPU
+Fallback reason  <reason>
 ```
 
-`gpu_preference: enabled` only means Origin Speak should try the GPU. The `compute` field reports what the resident actually loaded.
+`GPU preference: enabled` only means Origin Speak should try the GPU. `Active compute` reports what the resident actually loaded.
 
 Right after startup, the model may not be loaded yet:
 
 ```text
-compute: pending (model not loaded yet)
+Active compute   pending (model not loaded yet)
 ```
 
 Run `origin model status` again after a few seconds or after the first dictation.

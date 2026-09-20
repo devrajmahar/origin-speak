@@ -1129,13 +1129,16 @@ fn prompt_text(label: &str, default: &str) -> Result<String, String> {
 async fn config_command(action: ConfigAction) -> Result<CommandResult, String> {
     let mutating = matches!(action, ConfigAction::Set { .. } | ConfigAction::Reset(_));
     let result = CoreCliExecutor::new().config(&action).await?;
-    restart_after_mutation(result, mutating)
+    let mut result = restart_after_mutation(result, mutating)?;
+    if mutating {
+        result.human_output = Some(render_config_change(&result));
+    }
+    Ok(result)
 }
 
 async fn model_command(action: ModelAction, format: OutputFormat) -> Result<CommandResult, String> {
     let executor = CoreCliExecutor::new();
     let state = executor.state();
-    let restart = matches!(action, ModelAction::Select(_));
     let status_requested = matches!(action, ModelAction::Status);
     let mut result = with_model_download_progress(state, executor.model(&action), format).await?;
     if status_requested {
@@ -1147,7 +1150,17 @@ async fn model_command(action: ModelAction, format: OutputFormat) -> Result<Comm
             .unwrap_or_default();
         result = append_runtime_compute_status(result, &selected)?;
     }
-    restart_after_mutation(result, restart)
+    let restart = matches!(action, ModelAction::Select(_))
+        && (result_field(&result, "changed") == Some("true")
+            || result_field(&result, "installed_now") == Some("true"));
+    let mut result = restart_after_mutation(result, restart)?;
+    if !matches!(
+        action,
+        ModelAction::Help | ModelAction::List | ModelAction::Installed
+    ) {
+        result.human_output = Some(render_model_command_result(&result));
+    }
+    Ok(result)
 }
 
 async fn mic_command(action: MicAction) -> Result<CommandResult, String> {
@@ -1173,10 +1186,151 @@ fn restart_after_mutation(result: CommandResult, mutating: bool) -> Result<Comma
     match process_control::runtime_status()? {
         RuntimeState::Stopped => Ok(result.field("runtime_restarted", "false")),
         RuntimeState::Running => {
-            process_control::restart_runtime(&layout.runtime_path, COMMAND_TIMEOUT)?;
+            if let Err(error) =
+                process_control::restart_runtime(&layout.runtime_path, COMMAND_TIMEOUT)
+            {
+                return Err(format!(
+                    "{} was saved, but the resident runtime could not restart.\n\nDetails: {error}\n\nThe saved setting will be used the next time the runtime starts. Retry now with:\n  origin restart",
+                    result.message
+                ));
+            }
             Ok(result.field("runtime_restarted", "true"))
         }
     }
+}
+
+fn result_field<'a>(result: &'a CommandResult, key: &str) -> Option<&'a str> {
+    result
+        .fields
+        .iter()
+        .chain(result.human_fields.iter())
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn runtime_outcome(result: &CommandResult) -> &'static str {
+    match result_field(result, "runtime_restarted") {
+        Some("true") => "Runtime restarted successfully.",
+        Some("false") => "Runtime is stopped; the new setting will apply when it starts.",
+        Some(value) if value.contains("not installed") => {
+            "Runtime is not installed; the new setting was saved."
+        }
+        _ => "",
+    }
+}
+
+fn render_config_change(result: &CommandResult) -> String {
+    let action = if result.code == "config_reset" {
+        "Reset to default"
+    } else {
+        "Saved"
+    };
+    let mut output = format!(
+        "Origin Speak · Configuration\n\nSetting  {}\nValue    {}\nStatus   {action}",
+        result_field(result, "key").unwrap_or("unknown"),
+        result_field(result, "value").unwrap_or("unknown")
+    );
+    let runtime = runtime_outcome(result);
+    if !runtime.is_empty() {
+        output.push_str(&format!("\n\n{runtime}"));
+    }
+    output
+}
+
+fn render_model_command_result(result: &CommandResult) -> String {
+    match result.code {
+        "model_status" => {
+            let mut output = format!(
+                "Origin Speak · Model Status\n\nDefault model    {}\nInstalled        {}\nGPU preference   {}",
+                result_field(result, "selected").unwrap_or("unknown"),
+                yes_no(result_field(result, "downloaded") == Some("true")),
+                result_field(result, "gpu_preference").unwrap_or("unknown")
+            );
+            if let Some(compute) = result_field(result, "compute") {
+                output.push_str(&format!("\nActive compute   {compute}"));
+            }
+            if let Some(accelerator) = result_field(result, "accelerator") {
+                output.push_str(&format!("\nAccelerator      {accelerator}"));
+            }
+            if let Some(reason) = result_field(result, "compute_fallback") {
+                output.push_str(&format!("\nFallback reason  {reason}"));
+            }
+            output.push_str(
+                "\n\nChange model      origin model use <model-id>\nChange GPU mode   origin config set use_gpu <true|false>",
+            );
+            output
+        }
+        "model_selected" => {
+            let installed_now = result_field(result, "installed_now") == Some("true");
+            let changed = result_field(result, "changed") == Some("true");
+            let current = result_field(result, "selected").unwrap_or("unknown");
+            let mut output = format!(
+                "Origin Speak · Model Selection\n\nModel       {}\nIdentifier  {}\nStatus      {}",
+                result_field(result, "model_name").unwrap_or(current),
+                current,
+                if installed_now {
+                    "Installed and verified successfully"
+                } else {
+                    "Already installed"
+                }
+            );
+            if changed {
+                output.push_str(&format!(
+                    "\n\nDefault model changed\n  Previous  {}\n  Current   {current}",
+                    result_field(result, "previous").unwrap_or("unknown")
+                ));
+            } else {
+                output.push_str(
+                    "\n\nThis model is already the default; no selection change was needed.",
+                );
+            }
+            let runtime = runtime_outcome(result);
+            if !runtime.is_empty() {
+                output.push_str(&format!("\n\n{runtime}"));
+            }
+            output.push_str("\n\nOrigin Speak is ready.");
+            output
+        }
+        "model_downloaded" => format!(
+            "Origin Speak · Model Installation\n\nModel       {}\nIdentifier  {}\nStatus      {}\n\nSelect this model\n  origin model use {}",
+            result_field(result, "model_name").unwrap_or("unknown"),
+            result_field(result, "model").unwrap_or("unknown"),
+            if result_field(result, "downloaded_now") == Some("true") {
+                "Installed and verified successfully"
+            } else {
+                "Already installed; no download was needed"
+            },
+            result_field(result, "model").unwrap_or("<model-id>")
+        ),
+        "model_removed" => {
+            let mut output = format!(
+                "Origin Speak · Model Removal\n\nRemoved      {}\nIdentifier   {}",
+                result_field(result, "model_name").unwrap_or("unknown"),
+                result_field(result, "model").unwrap_or("unknown")
+            );
+            if let Some(bytes) =
+                result_field(result, "freed_bytes").and_then(|value| value.parse::<u64>().ok())
+            {
+                output.push_str(&format!("\nFreed        {}", format_bytes(bytes)));
+            }
+            output.push_str(&format!(
+                "\n\nInstalled models remaining: {}\nDefault model: {}",
+                result_field(result, "remaining_count").unwrap_or("unknown"),
+                result_field(result, "selected").unwrap_or("unknown")
+            ));
+            output
+        }
+        "model_not_installed" => format!(
+            "Origin Speak · Model Removal\n\n{} ({}) is not installed, so nothing was removed.\n\nView installed models\n  origin model installed",
+            result_field(result, "model_name").unwrap_or("Model"),
+            result_field(result, "model").unwrap_or("unknown")
+        ),
+        _ => result.message.clone(),
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "Yes" } else { "No" }
 }
 
 struct StagedBootstrapRuntime {
@@ -2621,6 +2775,16 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn selection_result(installed_now: bool, changed: bool) -> CommandResult {
+        CommandResult::success("model_selected", "Model large-v3 is now the default")
+            .field("selected", "large-v3")
+            .field("installed_now", installed_now.to_string())
+            .field("previous", if changed { "base.en" } else { "large-v3" })
+            .field("changed", changed.to_string())
+            .field("model_name", "Large v3 Multilingual")
+            .field("runtime_restarted", "true")
+    }
+
     #[test]
     fn terminal_progress_reports_percentage_speed_and_eta() {
         let line = progress_line(
@@ -2641,6 +2805,54 @@ mod tests {
     fn terminal_progress_formats_long_eta_compactly() {
         assert_eq!(format_eta(5), "5s");
         assert_eq!(format_eta(65), "1m 05s");
+    }
+
+    #[test]
+    fn successful_install_and_switch_reports_each_completed_stage() {
+        let output = render_model_command_result(&selection_result(true, true));
+        assert!(output.contains("Installed and verified successfully"));
+        assert!(output.contains("Previous  base.en"));
+        assert!(output.contains("Current   large-v3"));
+        assert!(output.contains("Runtime restarted successfully"));
+        assert!(output.contains("Origin Speak is ready"));
+    }
+
+    #[test]
+    fn already_installed_default_selection_is_a_clear_no_op() {
+        let output = render_model_command_result(&selection_result(false, false));
+        assert!(output.contains("Already installed"));
+        assert!(output.contains("already the default"));
+        assert!(!output.contains("Default model changed"));
+    }
+
+    #[test]
+    fn inactive_model_removal_reports_measured_bytes_and_remaining_state() {
+        let result = CommandResult::success("model_removed", "Removed model tiny.en")
+            .field("removed", "true")
+            .field("model", "tiny.en")
+            .field("model_name", "Tiny English")
+            .field("freed_bytes", (75 * 1024 * 1024_u64).to_string())
+            .field("remaining_count", "1")
+            .field("selected", "base.en");
+        let output = render_model_command_result(&result);
+        assert!(output.contains("Removed      Tiny English"));
+        assert!(output.contains("Freed        75.0 MiB"));
+        assert!(output.contains("Installed models remaining: 1"));
+        assert!(output.contains("Default model: base.en"));
+    }
+
+    #[test]
+    fn model_status_distinguishes_gpu_preference_from_active_compute() {
+        let result = CommandResult::success("model_status", "Transcription model status")
+            .field("selected", "base.en")
+            .field("downloaded", "true")
+            .field("gpu_preference", "enabled")
+            .field("compute", "CPU")
+            .field("compute_fallback", "GPU build unavailable");
+        let output = render_model_command_result(&result);
+        assert!(output.contains("GPU preference   enabled"));
+        assert!(output.contains("Active compute   CPU"));
+        assert!(output.contains("Fallback reason  GPU build unavailable"));
     }
 
     #[test]

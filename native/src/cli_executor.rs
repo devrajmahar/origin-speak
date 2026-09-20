@@ -11,8 +11,8 @@ use crate::cli::{
 };
 use crate::system_capabilities::SystemCapabilities;
 use origin_speak_lib::{
-    AppConfig, AppState, State, add_dictionary_word, delete_dictionary_word, delete_local_model,
-    download_local_model, get_audio_devices, get_config, get_dictionary_words,
+    AppConfig, AppState, LocalModelInfo, State, add_dictionary_word, delete_dictionary_word,
+    delete_local_model, download_local_model, get_audio_devices, get_config, get_dictionary_words,
     get_transcription_settings, get_trigger_hotkey, list_local_models, set_audio_device,
     set_config, set_transcription_model, set_trigger_hotkey, update_dictionary_word,
 };
@@ -126,8 +126,14 @@ impl CoreCliExecutor {
 
     pub async fn model(&self, action: &ModelAction) -> Result<CommandResult, String> {
         match action {
+            ModelAction::Help => Ok(CommandResult::success(
+                "model_help",
+                "Origin Speak model management help",
+            )
+            .human(model_help())),
             ModelAction::List => {
                 let models = list_local_models(State::new(self.state.as_ref())).await?;
+                let human = render_model_catalog(&models, terminal_width());
                 Ok(
                     CommandResult::success("models", "Available transcription models")
                         .field("models", render_models(&models))
@@ -138,7 +144,8 @@ impl CoreCliExecutor {
                                 .filter(|model| model.downloaded)
                                 .count()
                                 .to_string(),
-                        ),
+                        )
+                        .human(human),
                 )
             }
             ModelAction::Installed => {
@@ -153,10 +160,12 @@ impl CoreCliExecutor {
                 } else {
                     render_models(&installed)
                 };
+                let human = render_installed_models(&installed, terminal_width());
                 Ok(
                     CommandResult::success("installed_models", "Installed transcription models")
                         .field("models", summary)
-                        .field("installed_count", installed.len().to_string()),
+                        .field("installed_count", installed.len().to_string())
+                        .human(human),
                 )
             }
             ModelAction::Status => {
@@ -191,10 +200,12 @@ impl CoreCliExecutor {
                 let info = models
                     .iter()
                     .find(|entry| entry.id == *model)
-                    .ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
+                    .ok_or_else(|| unknown_model_error(model, &models))?;
                 let installed_now = !info.downloaded;
                 if installed_now {
-                    download_local_model(State::new(self.state.as_ref()), model.clone()).await?;
+                    download_local_model(State::new(self.state.as_ref()), model.clone())
+                        .await
+                        .map_err(|error| model_install_error(model, error))?;
                 }
                 if current != *model {
                     set_transcription_model(State::new(self.state.as_ref()), model.clone()).await?;
@@ -204,28 +215,52 @@ impl CoreCliExecutor {
                     format!("Model {model} is now the default"),
                 )
                 .field("selected", model)
-                .field("installed_now", installed_now.to_string()))
+                .field("installed_now", installed_now.to_string())
+                .human_field("previous", current.clone())
+                .human_field("changed", (current != *model).to_string())
+                .human_field("model_name", info.label.clone()))
             }
             ModelAction::Download(model) => {
                 let existing = list_local_models(State::new(self.state.as_ref())).await?;
-                let downloaded = existing
+                let info = existing
                     .iter()
                     .find(|entry| entry.id == *model)
-                    .is_some_and(|entry| entry.downloaded);
+                    .ok_or_else(|| unknown_model_error(model, &existing))?;
+                let downloaded = info.downloaded;
                 if !downloaded {
-                    download_local_model(State::new(self.state.as_ref()), model.clone()).await?;
+                    download_local_model(State::new(self.state.as_ref()), model.clone())
+                        .await
+                        .map_err(|error| model_install_error(model, error))?;
                 }
                 Ok(CommandResult::success(
                     "model_downloaded",
                     format!("Model {model} is available"),
                 )
-                .field("downloaded_now", (!downloaded).to_string()))
+                .field("downloaded_now", (!downloaded).to_string())
+                .human_field("model", model)
+                .human_field("model_name", info.label.clone()))
             }
             ModelAction::Remove(model) => {
+                let models = list_local_models(State::new(self.state.as_ref())).await?;
+                let info = models
+                    .iter()
+                    .find(|entry| entry.id == *model)
+                    .ok_or_else(|| unknown_model_error(model, &models))?;
                 let selected = get_transcription_settings(State::new(self.state.as_ref()))
                     .await?
                     .model;
                 ensure_model_removable(&selected, model)?;
+                if !info.downloaded {
+                    return Ok(CommandResult::success(
+                        "model_not_installed",
+                        format!("Model {model} is not installed"),
+                    )
+                    .field("removed", "false")
+                    .human_field("model", model)
+                    .human_field("model_name", info.label.clone())
+                    .human_field("selected", selected));
+                }
+                let installed_bytes = info.installed_bytes;
                 let removed =
                     delete_local_model(State::new(self.state.as_ref()), model.clone()).await?;
                 if !removed {
@@ -233,11 +268,28 @@ impl CoreCliExecutor {
                         "model_not_installed",
                         format!("Model {model} is not installed"),
                     )
-                    .field("removed", "false"));
+                    .field("removed", "false")
+                    .human_field("model", model)
+                    .human_field("model_name", info.label.clone())
+                    .human_field("selected", selected));
                 }
+                let remaining = models
+                    .iter()
+                    .filter(|entry| entry.downloaded && entry.id != *model)
+                    .count();
                 Ok(
                     CommandResult::success("model_removed", format!("Removed model {model}"))
-                        .field("removed", removed.to_string()),
+                        .field("removed", removed.to_string())
+                        .human_field("model", model)
+                        .human_field("model_name", info.label.clone())
+                        .human_field(
+                            "freed_bytes",
+                            installed_bytes
+                                .map(|bytes| bytes.to_string())
+                                .unwrap_or_default(),
+                        )
+                        .human_field("remaining_count", remaining.to_string())
+                        .human_field("selected", selected),
                 )
             }
         }
@@ -461,13 +513,17 @@ impl CoreCliExecutor {
                 let parsed = parse_cli_value(value);
                 *json_path_mut(&mut json, key)
                     .ok_or_else(|| format!("Unknown config key: {key}"))? = parsed;
+                let saved_value = json_scalar(
+                    json_path(&json, key).ok_or_else(|| format!("Unknown config key: {key}"))?,
+                )?;
                 let config: AppConfig = serde_json::from_value(json)
                     .map_err(|error| format!("Invalid value for {key}: {error}"))?;
                 set_config(State::new(self.state.as_ref()), config).await?;
-                Ok(CommandResult::success(
-                    "config_saved",
-                    format!("Saved {key}"),
-                ))
+                Ok(
+                    CommandResult::success("config_saved", format!("Saved {key}"))
+                        .human_field("key", key)
+                        .human_field("value", saved_value),
+                )
             }
             ConfigAction::Reset(key) => {
                 let config = get_config(State::new(self.state.as_ref())).await?;
@@ -478,15 +534,17 @@ impl CoreCliExecutor {
                 let default = json_path(&defaults, key)
                     .cloned()
                     .ok_or_else(|| format!("Unknown config key: {key}"))?;
+                let default_value = json_scalar(&default)?;
                 *json_path_mut(&mut current, key)
                     .ok_or_else(|| format!("Unknown config key: {key}"))? = default;
                 let config: AppConfig = serde_json::from_value(current)
                     .map_err(|error| format!("restore default {key}: {error}"))?;
                 set_config(State::new(self.state.as_ref()), config).await?;
-                Ok(CommandResult::success(
-                    "config_reset",
-                    format!("Reset {key} to its default"),
-                ))
+                Ok(
+                    CommandResult::success("config_reset", format!("Reset {key} to its default"))
+                        .human_field("key", key)
+                        .human_field("value", default_value),
+                )
             }
         }
     }
@@ -503,10 +561,51 @@ fn is_system_default_microphone(value: &str) -> bool {
 fn ensure_model_removable(selected: &str, target: &str) -> Result<(), String> {
     if selected == target {
         return Err(format!(
-            "Cannot remove the current default model '{target}'. Switch first with origin model use <other-model>, then run origin model remove {target}."
+            "Cannot remove '{target}' because it is the current default model.\n\nSwitch to another installed model first:\n  origin model use <other-model-id>\n\nThen retry:\n  origin model remove {target}\n\nRun 'origin model installed' to see possible replacements."
         ));
     }
     Ok(())
+}
+
+fn unknown_model_error(requested: &str, models: &[LocalModelInfo]) -> String {
+    let mut matches = models
+        .iter()
+        .map(|model| (edit_distance(requested, &model.id), model.id.as_str()))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(distance, id)| (*distance, *id));
+    let suggestions = matches
+        .into_iter()
+        .take(3)
+        .map(|(_, id)| format!("  {id}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Model not found: {requested}\n\nClosest supported models:\n{suggestions}\n\nRun 'origin model list' to view all supported models."
+    )
+}
+
+fn model_install_error(model: &str, error: String) -> String {
+    format!(
+        "Could not install model '{model}'. The default model was not changed.\n\nDetails: {error}\n\nCheck your network connection and available disk space, then retry:\n  origin model use {model}"
+    )
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            current.push(
+                (current[right_index] + 1).min(
+                    (previous[right_index + 1] + 1)
+                        .min(previous[right_index] + usize::from(left_char != *right_char)),
+                ),
+            );
+        }
+        previous = current;
+    }
+    previous[right_chars.len()]
 }
 
 fn render_models(models: &[origin_speak_lib::LocalModelInfo]) -> String {
@@ -536,6 +635,167 @@ fn render_models(models: &[origin_speak_lib::LocalModelInfo]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 30)
+        .unwrap_or(120)
+}
+
+fn model_status(model: &LocalModelInfo) -> String {
+    let mut states = Vec::new();
+    if model.selected && model.downloaded {
+        states.extend(["Default", "Installed"]);
+    } else if model.selected {
+        states.extend(["Default", "Missing"]);
+    } else if model.downloaded {
+        states.push("Installed");
+    } else {
+        states.push("Available");
+    }
+    if model.recommended {
+        states.push("Recommended");
+    }
+    states.join(" · ")
+}
+
+fn render_model_catalog(models: &[LocalModelInfo], width: usize) -> String {
+    let mut output = String::from("Origin Speak · Transcription Models\n\n");
+    output.push_str(&render_model_table(models, width));
+    let installed = models.iter().filter(|model| model.downloaded).count();
+    let defaults = models.iter().filter(|model| model.selected).count();
+    output.push_str(&format!(
+        "\n\nModels: {} available · {installed} installed · {defaults} default\n\n",
+        models.len()
+    ));
+    output.push_str(
+        "Actions\n  Install or switch model    origin model use <model-id>\n  Install without switching  origin model install <model-id>\n  View installed models      origin model installed\n  View active model / GPU    origin model status\n  Remove installed model     origin model remove <model-id>\n\nExample\n  origin model use large-v3",
+    );
+    output
+}
+
+fn model_help() -> &'static str {
+    "Origin Speak · Model Management\n\nUsage\n  origin model <command> [model-id]\n\nCommands\n  list                 Show every supported model and its state\n  installed            Show only models occupying local storage\n  status               Show the default model and active CPU/GPU compute\n  use <model-id>       Install if needed, then make the model the default\n  install <model-id>   Install without changing the default model\n  remove <model-id>    Remove an installed, non-default model\n\nExamples\n  origin model list\n  origin model use base.en\n  origin model install large-v3\n  origin model remove base.en\n  origin model status\n\nStable model IDs—not list row numbers—are required in commands and scripts.\nCompatibility aliases: select/switch, download, and delete/uninstall remain supported.\nUse --json anywhere in a command for machine-readable output."
+}
+
+fn render_installed_models(models: &[LocalModelInfo], width: usize) -> String {
+    let mut output = String::from("Origin Speak · Installed Models\n\n");
+    if models.is_empty() {
+        output.push_str(
+            "No transcription models are installed.\n\nInstall and select the recommended model:\n  origin model use base.en\n\nView all supported models:\n  origin model list",
+        );
+        return output;
+    }
+    output.push_str(&render_model_table(models, width));
+    let total = models
+        .iter()
+        .filter_map(|model| model.installed_bytes)
+        .sum::<u64>();
+    let complete = models.iter().all(|model| model.installed_bytes.is_some());
+    output.push_str(&format!("\n\nInstalled models: {}", models.len()));
+    if complete {
+        output.push_str(&format!(" · Total storage: {}", format_model_bytes(total)));
+    }
+    output.push_str("\n\nRemove a model\n  origin model remove <model-id>");
+    output
+}
+
+fn render_model_table(models: &[LocalModelInfo], width: usize) -> String {
+    let number_width = models.len().to_string().len().max(1);
+    let id_width = models
+        .iter()
+        .map(|model| display_width(&model.id))
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let name_width = models
+        .iter()
+        .map(|model| display_width(&model.label))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let size_width = 10;
+    let status_width = models
+        .iter()
+        .map(|model| display_width(&model_status(model)))
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let required_width =
+        1 + number_width + 2 + id_width + 2 + name_width + 2 + size_width + 2 + status_width;
+    if width < 88 || required_width > width {
+        let mut rows = String::from(" #  MODEL                 STATUS\n");
+        rows.push_str(&format!(" {}\n", "─".repeat(width.saturating_sub(2))));
+        for (index, model) in models.iter().enumerate() {
+            rows.push_str(&format!(
+                "{:>2}  {:<20}  {}\n    {}",
+                index + 1,
+                model.id,
+                model_status(model),
+                model.label
+            ));
+            if let Some(bytes) = model.installed_bytes {
+                rows.push_str(&format!(" · {}", format_model_bytes(bytes)));
+            }
+            rows.push('\n');
+        }
+        return rows.trim_end().to_string();
+    }
+
+    let mut rows = format!(
+        " {:>number_width$}  {}  {}  {}  STATUS\n",
+        "#",
+        pad_right("MODEL", id_width),
+        pad_right("NAME", name_width),
+        pad_right("SIZE", size_width)
+    );
+    rows.push_str(&format!(
+        " {}\n",
+        "─".repeat(required_width.saturating_sub(2))
+    ));
+    for (index, model) in models.iter().enumerate() {
+        let size = model
+            .installed_bytes
+            .map(format_model_bytes)
+            .unwrap_or_else(|| "—".to_string());
+        rows.push_str(&format!(
+            " {:>number_width$}  {}  {}  {}  {}\n",
+            index + 1,
+            pad_right(&model.id, id_width),
+            pad_right(&model.label, name_width),
+            pad_right(&size, size_width),
+            model_status(model)
+        ));
+    }
+    rows.trim_end().to_string()
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(display_width(value)))
+    )
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().map(character_width).sum()
+}
+
+fn character_width(ch: char) -> usize {
+    let code = ch as u32;
+    if ch.is_control()
+        || matches!(code, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f)
+    {
+        0
+    } else if matches!(code, 0x1100..=0x115f | 0x2329..=0x232a | 0x2e80..=0xa4cf | 0xac00..=0xd7a3 | 0xf900..=0xfaff | 0xfe10..=0xfe19 | 0xfe30..=0xfe6f | 0xff00..=0xff60 | 0xffe0..=0xffe6 | 0x1f300..=0x1faff | 0x20000..=0x3fffd)
+    {
+        2
+    } else {
+        1
+    }
 }
 
 fn format_model_bytes(bytes: u64) -> String {
@@ -592,6 +852,30 @@ fn json_scalar(value: &serde_json::Value) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn model(
+        id: &str,
+        label: &str,
+        downloaded: bool,
+        selected: bool,
+        recommended: bool,
+        bytes: Option<u64>,
+    ) -> LocalModelInfo {
+        LocalModelInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+            filename: format!("{id}.bin"),
+            revision: "test".to_string(),
+            sha256: "test".to_string(),
+            tier: "test".to_string(),
+            english_only: true,
+            recommended,
+            path: format!("models/{id}.bin"),
+            downloaded,
+            installed_bytes: bytes,
+            selected,
+        }
+    }
+
     #[test]
     fn dotted_config_path_mutation_is_precise() {
         let mut value = serde_json::json!({"ui": {"show_overlay": true}, "auto_copy": false});
@@ -625,9 +909,125 @@ mod tests {
     #[test]
     fn selected_model_cannot_be_removed() {
         let error = ensure_model_removable("base.en", "base.en").unwrap_err();
-        assert!(error.contains("origin model use <other-model>"));
+        assert!(error.contains("origin model use <other-model-id>"));
         assert!(error.contains("origin model remove base.en"));
         assert!(ensure_model_removable("base.en", "tiny.en").is_ok());
+    }
+
+    #[test]
+    fn model_catalog_has_ordered_rows_and_unambiguous_states() {
+        let models = vec![
+            model("tiny.en", "Tiny English", false, false, false, None),
+            model("base.en", "Base English", true, true, true, Some(1_500_000)),
+            model(
+                "small.en",
+                "Small English",
+                true,
+                false,
+                false,
+                Some(2_500_000),
+            ),
+        ];
+        let output = render_model_catalog(&models, 100);
+        assert!(output.contains(" 1  tiny.en"));
+        assert!(output.contains(" 2  base.en"));
+        assert!(output.contains("Default · Installed"));
+        assert!(output.contains("Installed"));
+        assert!(output.contains("Models: 3 available · 2 installed · 1 default"));
+        assert!(output.contains("origin model use <model-id>"));
+    }
+
+    #[test]
+    fn installed_models_empty_state_is_actionable() {
+        let output = render_installed_models(&[], 100);
+        assert!(output.contains("No transcription models are installed"));
+        assert!(output.contains("origin model use base.en"));
+        assert!(output.contains("origin model list"));
+    }
+
+    #[test]
+    fn installed_models_total_only_uses_known_sizes() {
+        let complete = vec![
+            model(
+                "base.en",
+                "Base English",
+                true,
+                true,
+                false,
+                Some(1024 * 1024),
+            ),
+            model(
+                "tiny.en",
+                "Tiny English",
+                true,
+                false,
+                false,
+                Some(2 * 1024 * 1024),
+            ),
+        ];
+        assert!(render_installed_models(&complete, 100).contains("Total storage: 3 MiB"));
+
+        let incomplete = vec![
+            complete[0].clone(),
+            model("tiny.en", "Tiny English", true, false, false, None),
+        ];
+        assert!(!render_installed_models(&incomplete, 100).contains("Total storage"));
+    }
+
+    #[test]
+    fn narrow_model_table_keeps_every_row_and_name() {
+        let models = vec![
+            model("base.en", "Base English", false, false, true, None),
+            model(
+                "canary-qwen-2.5b",
+                "Canary-Qwen 2.5B (Q8)",
+                true,
+                true,
+                false,
+                Some(2_797_548_928),
+            ),
+        ];
+        let output = render_model_table(&models, 48);
+        assert!(output.contains(" 1  base.en"));
+        assert!(output.contains(" 2  canary-qwen-2.5b"));
+        assert!(output.contains("Canary-Qwen 2.5B (Q8) · 2.61 GiB"));
+    }
+
+    #[test]
+    fn table_padding_uses_terminal_cell_width_for_unicode() {
+        assert_eq!(display_width("Model"), 5);
+        assert_eq!(display_width("模型"), 4);
+        assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(display_width(&pad_right("模型", 8)), 8);
+    }
+
+    #[test]
+    fn invalid_model_error_suggests_real_ids_and_list_command() {
+        let models = vec![
+            model("large-v3", "Large v3", false, false, false, None),
+            model(
+                "large-v3-turbo",
+                "Large v3 Turbo",
+                false,
+                false,
+                false,
+                None,
+            ),
+            model("base.en", "Base English", false, false, true, None),
+        ];
+        let error = unknown_model_error("large-v4", &models);
+        assert!(error.contains("Model not found: large-v4"));
+        assert!(error.contains("large-v3"));
+        assert!(error.contains("large-v3-turbo"));
+        assert!(error.contains("origin model list"));
+    }
+
+    #[test]
+    fn failed_install_message_preserves_default_and_has_retry() {
+        let error = model_install_error("large-v3", "network unavailable".to_string());
+        assert!(error.contains("default model was not changed"));
+        assert!(error.contains("network unavailable"));
+        assert!(error.contains("origin model use large-v3"));
     }
 
     #[test]

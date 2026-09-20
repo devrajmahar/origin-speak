@@ -67,7 +67,15 @@ Windows lifecycle control uses native named-object/process primitives and starts
 
 Autostart targets the resident runtime directly. The console manager is invoked only when the user or automation needs a management operation.
 
-Model management is explicit but compact: `origin model list` shows catalog state, `origin model installed` filters to local models, `origin model install <id>` downloads without changing the default, `origin model use <id>` installs when necessary and then makes that model the default, and `origin model remove <id>` deletes a non-default local model. The older `download` and `select` spellings remain compatibility aliases.
+Model management is explicit but compact: `origin model list` shows one numbered table row per catalog model with separate stable ID, display name, measured installed size, and state columns. The row number is never accepted as an identifier. `origin model installed` filters to local models, reports the count and an accurate total when all file sizes are available, and provides an actionable empty state. `origin model status` combines the persisted default and GPU preference with the resident's actual CPU/GPU state.
+
+`origin model install <id>` downloads and verifies without changing the default. `origin model use <id>` avoids redundant downloads, installs and verifies when necessary, persists the new default only after installation succeeds, and restarts a running resident. Its final output distinguishes installation, selection, and runtime outcomes. A restart failure therefore says that the selection was saved and gives `origin restart` as the recovery action instead of misreporting the entire operation as unsuccessful.
+
+`origin model remove <id>` validates catalog membership and installation state before deletion. It refuses to remove the current default, never chooses a replacement silently, and tells the user to switch first. Successful output names the model, reports reclaimed bytes only when measured before deletion, and shows the remaining count and unchanged default. Unknown IDs include close catalog matches, while failed installations preserve the prior default and include a retry command.
+
+`origin model --help` documents the complete workflow and examples. The older `download`, `select`/`switch`, and `delete`/`uninstall` spellings remain compatibility aliases.
+
+Human model output is intentionally unstyled and remains readable without color. Wide terminals receive an aligned table; narrow terminals receive a compact two-line row layout. `COLUMNS` is honored when it contains a sensible width. Stable `--json` rendering ignores all human presentation text, terminal width, progress, and contextual suggestions.
 
 Mutating CLI operations persist through the backend typed APIs. If an installed resident runtime is already running, model switching, microphone selection, dictation-hotkey changes, and config set/reset automatically restart it so the new persisted state takes effect immediately.
 

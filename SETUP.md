@@ -42,6 +42,7 @@ Useful management commands include:
 ```text
 origin status
 origin doctor
+origin model --help
 origin model list
 origin model installed
 origin model status
@@ -68,6 +69,8 @@ origin uninstall
 ```
 
 The manager supports `--json` for machine-readable output without ANSI/progress animation. In a human terminal, model and update downloads show live byte/percentage/throughput/ETA progress.
+
+Model table row numbers are display-only. Use the stable ID in the `MODEL` column with `install`, `use`, and `remove`. `use` installs and verifies first when needed, then changes the default and restarts a running resident. `install` leaves the default unchanged. The current default cannot be removed; switch to another model first. `origin model installed` reports local storage use, and `origin model status` reports both the GPU preference and the compute backend actually loaded by the resident.
 
 On Windows, `origin update` may report that installation is scheduled because the running `origin.exe` cannot replace itself. The post-exit helper records the final result durably; the next `origin status` or update command reports whether that replacement completed or failed.
 
