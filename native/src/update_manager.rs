@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
@@ -23,6 +23,8 @@ const MANIFEST_MAX_BYTES: usize = 128 * 1024;
 const PAYLOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const PAYLOAD_DOWNLOAD_ATTEMPTS: usize = 4;
 const PAYLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const PAYLOAD_THROUGHPUT_WINDOW: Duration = Duration::from_secs(15);
+const PAYLOAD_MIN_BYTES_PER_SECOND: u64 = 64 * 1024;
 pub const DEFAULT_BOOTSTRAP_MANIFEST_URL: &str =
     "https://github.com/devrajmahar/origin-speak/releases/latest/download/bootstrap-update.json";
 const GITHUB_RELEASES_BASE_URL: &str =
@@ -544,8 +546,17 @@ where
 
     let mut last_error = String::new();
     for attempt in 0..PAYLOAD_DOWNLOAD_ATTEMPTS {
-        match download_payload_attempt(client, payload, &url, &partial, &destination, on_progress)
-            .await
+        let reconnect_slow_transfer = attempt + 1 < PAYLOAD_DOWNLOAD_ATTEMPTS;
+        match download_payload_attempt(
+            client,
+            payload,
+            &url,
+            &partial,
+            &destination,
+            reconnect_slow_transfer,
+            on_progress,
+        )
+        .await
         {
             Ok(path) => return Ok(path),
             Err(error) => {
@@ -569,6 +580,7 @@ async fn download_payload_attempt<F>(
     url: &reqwest::Url,
     partial: &Path,
     destination: &Path,
+    reconnect_slow_transfer: bool,
     on_progress: &mut F,
 ) -> Result<PathBuf, String>
 where
@@ -644,6 +656,8 @@ where
     let mut file = open_safe_partial(partial, append).await?;
     let mut stream = response.bytes_stream();
     let mut downloaded = resume_offset;
+    let mut throughput_started = Instant::now();
+    let mut throughput_bytes = downloaded;
     on_progress(&payload.path, downloaded, expected_total);
     loop {
         let next = tokio::time::timeout(PAYLOAD_STALL_TIMEOUT, stream.next())
@@ -667,6 +681,24 @@ where
             .await
             .map_err(|error| format!("write {}: {error}", partial.display()))?;
         on_progress(&payload.path, downloaded, expected_total);
+
+        let throughput_elapsed = throughput_started.elapsed();
+        if throughput_elapsed >= PAYLOAD_THROUGHPUT_WINDOW {
+            let window_bytes = downloaded.saturating_sub(throughput_bytes);
+            if reconnect_slow_transfer && transfer_is_too_slow(window_bytes, throughput_elapsed) {
+                file.flush()
+                    .await
+                    .map_err(|error| format!("flush {}: {error}", partial.display()))?;
+                return Err(format!(
+                    "download {} stayed below {} KiB/s for {} seconds; reconnecting",
+                    payload.path,
+                    PAYLOAD_MIN_BYTES_PER_SECOND / 1024,
+                    throughput_elapsed.as_secs()
+                ));
+            }
+            throughput_started = Instant::now();
+            throughput_bytes = downloaded;
+        }
     }
     file.flush()
         .await
@@ -694,6 +726,12 @@ where
     }
 
     install_verified_partial(partial, destination, payload).await
+}
+
+fn transfer_is_too_slow(bytes: u64, elapsed: Duration) -> bool {
+    elapsed >= PAYLOAD_THROUGHPUT_WINDOW
+        && (bytes as u128) * 1_000_000_000
+            < (PAYLOAD_MIN_BYTES_PER_SECOND as u128) * elapsed.as_nanos()
 }
 
 async fn verified_existing_payload(path: &Path, expected_sha256: &str) -> Result<bool, String> {
@@ -916,6 +954,20 @@ mod tests {
         assert!(parse_content_range(Some("bytes 0-1023/4096"), 1024, Some(1024)).is_err());
         assert!(parse_content_range(Some("bytes 1024-2047/4096"), 1024, Some(512)).is_err());
         assert!(parse_content_range(None, 1024, Some(1024)).is_err());
+    }
+
+    #[test]
+    fn slow_transfer_reconnect_uses_a_sustained_conservative_floor() {
+        let window = PAYLOAD_THROUGHPUT_WINDOW;
+        let floor_bytes = PAYLOAD_MIN_BYTES_PER_SECOND * window.as_secs();
+
+        assert!(!transfer_is_too_slow(
+            PAYLOAD_MIN_BYTES_PER_SECOND,
+            window - Duration::from_secs(1)
+        ));
+        assert!(transfer_is_too_slow(floor_bytes - 1, window));
+        assert!(!transfer_is_too_slow(floor_bytes, window));
+        assert!(!transfer_is_too_slow(floor_bytes * 10, window));
     }
 
     #[tokio::test]
