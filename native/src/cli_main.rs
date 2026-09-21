@@ -100,6 +100,11 @@ impl TerminalProgress {
         }
 
         let now = Instant::now();
+        if downloaded < self.last_bytes {
+            self.last_sample = now;
+            self.last_bytes = downloaded;
+            self.bytes_per_second = 0.0;
+        }
         let elapsed = now.duration_since(self.last_sample).as_secs_f64();
         if elapsed >= 0.2 && downloaded >= self.last_bytes {
             let instant = (downloaded - self.last_bytes) as f64 / elapsed;

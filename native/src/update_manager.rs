@@ -5,6 +5,8 @@
 //! and macOS runtime payloads are signed app-bundle ZIPs.
 
 use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +21,8 @@ use tokio::io::AsyncWriteExt;
 const SCHEMA_VERSION: u32 = 2;
 const MANIFEST_MAX_BYTES: usize = 128 * 1024;
 const PAYLOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const PAYLOAD_DOWNLOAD_ATTEMPTS: usize = 4;
+const PAYLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_BOOTSTRAP_MANIFEST_URL: &str =
     "https://github.com/devrajmahar/origin-speak/releases/latest/download/bootstrap-update.json";
 const GITHUB_RELEASES_BASE_URL: &str =
@@ -180,7 +184,7 @@ where
         })
     }
     .await;
-    cleanup_staging_after_failure(result, staging_dir, &update.version).await
+    result
 }
 
 pub fn verify_staged_payload(
@@ -328,25 +332,10 @@ where
         download_payload(&client, &release.runtime, staging_dir, &mut on_progress).await
     }
     .await;
-    cleanup_staging_after_failure(result, staging_dir, &release.version).await
+    result
 }
 
-async fn cleanup_staging_after_failure<T>(
-    result: Result<T, String>,
-    staging_dir: &Path,
-    version: &Version,
-) -> Result<T, String> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => match cleanup_owned_staging_dir(staging_dir, version).await {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(format!(
-                "{error}; cleanup of owned update staging also failed: {cleanup_error}"
-            )),
-        },
-    }
-}
-
+#[cfg(test)]
 async fn cleanup_owned_staging_dir(staging_dir: &Path, version: &Version) -> Result<(), String> {
     let metadata = match tokio::fs::symlink_metadata(staging_dir).await {
         Ok(metadata) => metadata,
@@ -541,75 +530,214 @@ where
 {
     validate_payload_shape(payload)?;
     let url = secure_url(&payload.url, "update payload")?;
-    let response = client
-        .get(url)
+    let destination = staging_dir.join(&payload.path);
+    let partial = staging_dir.join(format!("{}.part", payload.path));
+
+    if verified_existing_payload(&destination, &payload.sha256).await? {
+        let size = tokio::fs::metadata(&destination)
+            .await
+            .map_err(|error| format!("inspect staged {}: {error}", destination.display()))?
+            .len();
+        on_progress(&payload.path, size, Some(size));
+        return Ok(destination);
+    }
+
+    let mut last_error = String::new();
+    for attempt in 0..PAYLOAD_DOWNLOAD_ATTEMPTS {
+        match download_payload_attempt(client, payload, &url, &partial, &destination, on_progress)
+            .await
+        {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                last_error = error;
+                if attempt + 1 < PAYLOAD_DOWNLOAD_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "download {} failed after {PAYLOAD_DOWNLOAD_ATTEMPTS} attempts: {last_error}",
+        payload.path
+    ))
+}
+
+async fn download_payload_attempt<F>(
+    client: &reqwest::Client,
+    payload: &Payload,
+    url: &reqwest::Url,
+    partial: &Path,
+    destination: &Path,
+    on_progress: &mut F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(&str, u64, Option<u64>),
+{
+    let mut resume_offset = safe_partial_len(partial).await?;
+    if resume_offset > PAYLOAD_MAX_BYTES {
+        tokio::fs::remove_file(partial)
+            .await
+            .map_err(|error| format!("remove oversized partial {}: {error}", partial.display()))?;
+        resume_offset = 0;
+    }
+
+    let mut request = client.get(url.clone());
+    if resume_offset > 0 {
+        request = request.header(RANGE, format!("bytes={resume_offset}-"));
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("download {}: {error}", payload.path))?;
     ensure_secure_url(response.url(), "update payload redirect target")?;
+
+    if resume_offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        if hash_file_async(partial.to_path_buf()).await? == payload.sha256 {
+            return install_verified_partial(partial, destination, payload).await;
+        }
+        tokio::fs::remove_file(partial)
+            .await
+            .map_err(|error| format!("remove rejected partial {}: {error}", partial.display()))?;
+        return Err(format!(
+            "server rejected the saved range for {}; restarting",
+            payload.path
+        ));
+    }
+
+    let status = response.status();
     let response = response
         .error_for_status()
         .map_err(|error| format!("download {}: {error}", payload.path))?;
-    let expected_total = response.content_length();
+    let content_length = response.content_length();
+    let content_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+
+    let (append, expected_total) = match status {
+        StatusCode::PARTIAL_CONTENT => {
+            let total = parse_content_range(content_range, resume_offset, content_length)?;
+            (resume_offset > 0, Some(total))
+        }
+        StatusCode::OK => {
+            if resume_offset > 0 {
+                tokio::fs::remove_file(partial).await.map_err(|error| {
+                    format!("restart partial download {}: {error}", partial.display())
+                })?;
+                resume_offset = 0;
+            }
+            (false, content_length)
+        }
+        _ => {
+            return Err(format!(
+                "download {} returned unexpected HTTP {status}",
+                payload.path
+            ));
+        }
+    };
+
     if expected_total.is_some_and(|size| size > PAYLOAD_MAX_BYTES) {
         return Err(format!("{} exceeds the 1 GiB safety limit", payload.path));
     }
 
-    let destination = staging_dir.join(&payload.path);
-    let partial = staging_dir.join(format!("{}.part", payload.path));
-    let mut file = create_safe_partial(&partial).await?;
+    let mut file = open_safe_partial(partial, append).await?;
     let mut stream = response.bytes_stream();
-    let mut hasher = Sha256::new();
-    let mut total = 0_u64;
-    on_progress(&payload.path, 0, expected_total);
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Err(format!("download {}: {error}", payload.path));
-            }
-        };
-        total = total.saturating_add(chunk.len() as u64);
-        if total > PAYLOAD_MAX_BYTES {
-            drop(file);
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(format!("{} exceeds the 1 GiB safety limit", payload.path));
+    let mut downloaded = resume_offset;
+    on_progress(&payload.path, downloaded, expected_total);
+    loop {
+        let next = tokio::time::timeout(PAYLOAD_STALL_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| {
+                format!(
+                    "download {} stalled for {} seconds",
+                    payload.path,
+                    PAYLOAD_STALL_TIMEOUT.as_secs()
+                )
+            })?;
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| format!("download {}: {error}", payload.path))?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > PAYLOAD_MAX_BYTES
+            || expected_total.is_some_and(|expected| downloaded > expected)
+        {
+            return Err(format!("{} exceeded its declared size", payload.path));
         }
-        hasher.update(&chunk);
-        if let Err(error) = file.write_all(&chunk).await {
-            drop(file);
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(format!("write {}: {error}", partial.display()));
-        }
-        on_progress(&payload.path, total, expected_total);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("write {}: {error}", partial.display()))?;
+        on_progress(&payload.path, downloaded, expected_total);
     }
-    if let Err(error) = file.flush().await {
-        drop(file);
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(format!("flush {}: {error}", partial.display()));
-    }
-    if let Err(error) = file.sync_all().await {
-        drop(file);
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(format!("sync {}: {error}", partial.display()));
-    }
+    file.flush()
+        .await
+        .map_err(|error| format!("flush {}: {error}", partial.display()))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("sync {}: {error}", partial.display()))?;
     drop(file);
-    if total == 0 {
-        let _ = tokio::fs::remove_file(&partial).await;
+
+    if downloaded == 0 {
         return Err(format!("downloaded {} is empty", payload.path));
     }
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != payload.sha256 {
-        let _ = tokio::fs::remove_file(&partial).await;
+    if expected_total.is_some_and(|expected| downloaded != expected) {
+        return Err(format!(
+            "download {} ended at {downloaded} bytes, expected {}",
+            payload.path,
+            expected_total.unwrap_or_default()
+        ));
+    }
+    if hash_file_async(partial.to_path_buf()).await? != payload.sha256 {
+        tokio::fs::remove_file(partial)
+            .await
+            .map_err(|error| format!("remove corrupt partial {}: {error}", partial.display()))?;
         return Err(format!("SHA-256 verification failed for {}", payload.path));
     }
+
+    install_verified_partial(partial, destination, payload).await
+}
+
+async fn verified_existing_payload(path: &Path, expected_sha256: &str) -> Result<bool, String> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "inspect staged payload {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
+        return Err(format!(
+            "refusing staged payload that is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > PAYLOAD_MAX_BYTES {
+        tokio::fs::remove_file(path).await.map_err(|error| {
+            format!("remove invalid staged payload {}: {error}", path.display())
+        })?;
+        return Ok(false);
+    }
+    if hash_file_async(path.to_path_buf()).await? == expected_sha256 {
+        Ok(true)
+    } else {
+        tokio::fs::remove_file(path).await.map_err(|error| {
+            format!("remove corrupt staged payload {}: {error}", path.display())
+        })?;
+        Ok(false)
+    }
+}
+
+async fn install_verified_partial(
+    partial: &Path,
+    destination: &Path,
+    payload: &Payload,
+) -> Result<PathBuf, String> {
     match tokio::fs::remove_file(&destination).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            let _ = tokio::fs::remove_file(&partial).await;
             return Err(format!(
                 "remove stale staged payload {}: {error}",
                 destination.display()
@@ -617,40 +745,95 @@ where
         }
     }
     if let Err(error) = tokio::fs::rename(&partial, &destination).await {
-        let _ = tokio::fs::remove_file(&partial).await;
         return Err(format!("stage {}: {error}", payload.path));
     }
-    Ok(destination)
+    Ok(destination.to_path_buf())
 }
 
-async fn create_safe_partial(path: &Path) -> Result<tokio::fs::File, String> {
+async fn safe_partial_len(path: &Path) -> Result<u64, String> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
+            if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
                 return Err(format!(
-                    "refusing to overwrite non-regular update partial: {}",
+                    "refusing non-regular update partial: {}",
                     path.display()
                 ));
             }
-            tokio::fs::remove_file(path)
-                .await
-                .map_err(|error| format!("remove stale partial {}: {error}", path.display()))?;
+            Ok(metadata.len())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!(
+            "inspect update partial {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+async fn open_safe_partial(path: &Path, append: bool) -> Result<tokio::fs::File, String> {
+    let existing = safe_partial_len(path).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    if append {
+        if existing == 0 {
             return Err(format!(
-                "inspect update partial {}: {error}",
+                "resume partial is missing or empty: {}",
                 path.display()
             ));
         }
+        options.append(true);
+    } else {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("remove stale partial {}: {error}", path.display()));
+            }
+        }
+        options.write(true).create_new(true);
     }
-
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
     options
         .open(path)
         .await
-        .map_err(|error| format!("create {}: {error}", path.display()))
+        .map_err(|error| format!("open {}: {error}", path.display()))
+}
+
+async fn hash_file_async(path: PathBuf) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || sha256_file(&path))
+        .await
+        .map_err(|error| format!("hash update payload task failed: {error}"))?
+}
+
+fn parse_content_range(
+    content_range: Option<&str>,
+    expected_start: u64,
+    content_length: Option<u64>,
+) -> Result<u64, String> {
+    let value = content_range.ok_or_else(|| "resume response omitted Content-Range".to_string())?;
+    let value = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let (range, total) = value
+        .split_once('/')
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| format!("invalid Content-Range: {value}"))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range start: {value}"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range end: {value}"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| format!("invalid Content-Range total: {value}"))?;
+    if start != expected_start || end < start || total <= end {
+        return Err(format!("unexpected Content-Range: {value}"));
+    }
+    let range_len = end - start + 1;
+    if content_length.is_some_and(|length| length != range_len) {
+        return Err(format!("Content-Range length mismatch: {value}"));
+    }
+    Ok(total)
 }
 
 fn validate_payload_shape(payload: &Payload) -> Result<(), String> {
@@ -725,6 +908,34 @@ mod tests {
     }
 
     #[test]
+    fn resumed_download_requires_an_exact_content_range() {
+        assert_eq!(
+            parse_content_range(Some("bytes 1024-2047/4096"), 1024, Some(1024)).unwrap(),
+            4096
+        );
+        assert!(parse_content_range(Some("bytes 0-1023/4096"), 1024, Some(1024)).is_err());
+        assert!(parse_content_range(Some("bytes 1024-2047/4096"), 1024, Some(512)).is_err());
+        assert!(parse_content_range(None, 1024, Some(1024)).is_err());
+    }
+
+    #[tokio::test]
+    async fn regular_partial_is_retained_for_resume() {
+        let root = std::env::temp_dir().join(format!(
+            "origin-speak-update-resume-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let partial = root.join("payload.part");
+        std::fs::write(&partial, b"saved bytes").unwrap();
+        assert_eq!(safe_partial_len(&partial).await.unwrap(), 11);
+        let file = open_safe_partial(&partial, true).await.unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&partial).unwrap(), b"saved bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn default_manifest_uses_github_releases_latest_download() {
         assert_eq!(
             DEFAULT_BOOTSTRAP_MANIFEST_URL,
@@ -771,7 +982,7 @@ mod tests {
             let partial = root.join("payload.part");
             std::fs::write(&target, b"keep").unwrap();
             symlink(&target, &partial).unwrap();
-            assert!(create_safe_partial(&partial).await.is_err());
+            assert!(safe_partial_len(&partial).await.is_err());
             assert_eq!(std::fs::read(&target).unwrap(), b"keep");
             std::fs::remove_dir_all(&root).unwrap();
         }
