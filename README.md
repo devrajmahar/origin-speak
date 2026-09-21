@@ -210,4 +210,4 @@ Implementation and contributor documentation:
 
 ## License
 
-Origin Speak is released under the [MIT License](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Origin Speak is released under the [MIT License](LICENSE).

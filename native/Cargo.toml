@@ -1,6 +1,7 @@
 [package]
 name = "origin-speak-native"
 version = "0.1.33"
+license = "MIT"
 edition = "2024"
 publish = false
 autobins = false

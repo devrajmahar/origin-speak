@@ -325,7 +325,6 @@ jobs:
             --output dist/publish/bootstrap-update.json
           cp "dist/publish/origin-speak-$VERSION-windows-x86_64.exe" dist/publish/origin-windows-x86_64.exe
           cp "dist/publish/origin-speak-$VERSION-macos-universal" dist/publish/origin-macos-universal
-          cp THIRD_PARTY_NOTICES.md dist/publish/THIRD_PARTY_NOTICES.md
 
       - name: Validate CLI/bootstrap update contract
         shell: bash
@@ -361,7 +360,7 @@ jobs:
 
           Install entirely from the terminal by downloading the latest `origin` manager and running `setup`.
 
-          Release assets include versioned manager/runtime payloads, stable manager aliases for terminal installation, platform checksum files, bootstrap-update.json, and THIRD_PARTY_NOTICES.md.
+          Release assets include versioned manager/runtime payloads, stable manager aliases for terminal installation, platform checksum files, and bootstrap-update.json.
 
           Trust status:
           - Windows: $WINDOWS_NOTE.

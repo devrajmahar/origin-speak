@@ -3,7 +3,7 @@ name = "origin-speak-backend"
 version = "0.1.33"
 description = "Origin Speak - local voice-to-text dictation engine"
 authors = ["Origin Speak"]
-license = "PROPRIETARY"
+license = "MIT"
 edition = "2021"
 
 [features]
