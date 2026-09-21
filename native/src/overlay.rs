@@ -8,6 +8,18 @@ use std::time::{Duration, Instant};
 const STATUS_WIDTH: f32 = 88.0;
 const STATUS_HEIGHT: f32 = 32.0;
 const BOTTOM_MARGIN: f32 = 28.0;
+const CHIP_BORDER_WIDTH: f32 = 0.5;
+
+fn smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn completion_pop(elapsed: f32) -> f32 {
+    let settle = 1.0 - (-elapsed * 12.0).exp();
+    let bounce = (-elapsed * 7.0).exp() * (elapsed * 22.0).sin() * 0.16;
+    (settle + bounce).clamp(0.72, 1.08)
+}
 
 fn bottom_center_bounds(display_bounds: Bounds<Pixels>, width: f32, height: f32) -> Bounds<Pixels> {
     Bounds {
@@ -123,23 +135,24 @@ impl StatusOverlayView {
             .justify_center()
             .gap(px(6.0));
         for index in 0..3 {
-            let pulse = ((phase * std::f32::consts::TAU + index as f32 * 2.1).sin() + 1.0) * 0.5;
+            let wave = ((phase * std::f32::consts::TAU - index as f32 * 1.45).sin() + 1.0) * 0.5;
+            let pulse = smoothstep(wave);
             dots = dots.child(
                 div()
-                    .size(px(8.0))
+                    .size(px(5.5 + pulse * 3.0))
                     .rounded_full()
-                    .bg(self.tokens.primary.alpha(0.24 + pulse * 0.76)),
+                    .bg(self.tokens.primary.alpha(0.28 + pulse * 0.72)),
             );
         }
         dots
     }
 
-    fn state_marker(&self, state: OverlayState, level: f32, phase: f32) -> Div {
+    fn state_marker(&self, state: OverlayState, level: f32, phase: f32, elapsed: f32) -> Div {
         match state {
             OverlayState::Listening => self.listening_indicator(level, phase),
             OverlayState::Processing => self.processing_indicator(phase),
             OverlayState::Success => {
-                let pulse = ((phase * std::f32::consts::TAU).sin() + 1.0) * 0.5;
+                let pop = completion_pop(elapsed);
                 div()
                     .w(px(72.0))
                     .h(px(20.0))
@@ -148,9 +161,9 @@ impl StatusOverlayView {
                     .justify_center()
                     .child(
                         div()
-                            .size(px(16.0))
+                            .size(px(16.0 * pop))
                             .rounded_full()
-                            .bg(self.tokens.positive.alpha(0.30 + pulse * 0.32))
+                            .bg(self.tokens.positive.alpha(0.42))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -162,7 +175,7 @@ impl StatusOverlayView {
                     )
             }
             OverlayState::Error => {
-                let pulse = ((phase * std::f32::consts::TAU).sin() + 1.0) * 0.5;
+                let pop = completion_pop(elapsed);
                 div()
                     .w(px(72.0))
                     .h(px(20.0))
@@ -171,9 +184,9 @@ impl StatusOverlayView {
                     .justify_center()
                     .child(
                         div()
-                            .size(px(16.0))
+                            .size(px(16.0 * pop))
                             .rounded_full()
-                            .bg(self.tokens.negative.alpha(0.30 + pulse * 0.32))
+                            .bg(self.tokens.negative.alpha(0.42))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -195,14 +208,17 @@ impl Render for StatusOverlayView {
         window.request_animation_frame();
         let target_level = level.clamp(0.0, 1.0);
         self.smoothed_level += (target_level - self.smoothed_level) * 0.16;
-        let phase = (self.state_started_at.elapsed().as_secs_f32() / 0.72).fract();
+        let elapsed = self.state_started_at.elapsed().as_secs_f32();
+        let phase = (elapsed / 0.82).fract();
 
         div()
             .size_full()
-            .bg(self.tokens.muted)
+            .border(px(CHIP_BORDER_WIDTH))
+            .border_color(self.tokens.chip_border)
+            .bg(self.tokens.chip_surface)
             .flex()
             .items_center()
             .justify_center()
-            .child(self.state_marker(state, self.smoothed_level, phase))
+            .child(self.state_marker(state, self.smoothed_level, phase, elapsed))
     }
 }

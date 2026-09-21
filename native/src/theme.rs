@@ -14,6 +14,8 @@ pub struct DesignTokens {
     pub negative: Hsla,
     pub border: Hsla,
     pub ring: Hsla,
+    pub chip_surface: Hsla,
+    pub chip_border: Hsla,
 }
 
 impl Default for DesignTokens {
@@ -29,6 +31,8 @@ impl Default for DesignTokens {
             negative: rgb(0xf7525f).into(),
             border: rgb(0x16191f).into(),
             ring: rgb(0x73777e).into(),
+            chip_surface: rgb(0x141414).into(),
+            chip_border: rgba(0xf0f0f014).into(),
         }
     }
 }

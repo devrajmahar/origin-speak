@@ -22,7 +22,6 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 pub const DEFAULT_MODEL: &str = "base.en";
-const WHISPER_BEAM_SIZE: i32 = 5;
 const GGML_MAGIC: [u8; 4] = *b"lmgg";
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const MIN_MODEL_FILE_BYTES: u64 = 1024 * 1024;
@@ -1812,6 +1811,10 @@ fn run_whisper_inference(
     let mut state = context
         .create_state()
         .map_err(|error| WhisperInferenceError::State(error.to_string()))?;
+    // Interactive dictation is latency-sensitive. Beam search multiplies the
+    // decoder work and becomes especially expensive for large-v3, making the
+    // resident appear hung while inference still holds the model lock. Greedy
+    // decoding is Whisper's fast path and avoids that unbounded latency spike.
     let mut params = FullParams::new(whisper_sampling_strategy());
     params.set_n_threads(cpu_thread_count());
     params.set_translate(false);
@@ -1859,13 +1862,7 @@ fn run_whisper_inference(
 }
 
 fn whisper_sampling_strategy() -> SamplingStrategy {
-    // Match the reference Whisper CLI's accuracy-oriented default. Beam search
-    // keeps several likely token sequences alive instead of committing to the
-    // first locally best token, trading some latency for fewer substitutions.
-    SamplingStrategy::BeamSearch {
-        beam_size: WHISPER_BEAM_SIZE,
-        patience: -1.0,
-    }
+    SamplingStrategy::Greedy { best_of: 1 }
 }
 
 fn recognition_prompt(hints: &[(String, Option<String>)]) -> String {
@@ -2650,16 +2647,12 @@ mod tests {
     }
 
     #[test]
-    fn whisper_uses_accuracy_oriented_beam_search() {
+    fn whisper_uses_latency_oriented_greedy_decoding() {
         match whisper_sampling_strategy() {
-            SamplingStrategy::BeamSearch {
-                beam_size,
-                patience,
-            } => {
-                assert_eq!(beam_size, 5);
-                assert_eq!(patience, -1.0);
+            SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
+            SamplingStrategy::BeamSearch { .. } => {
+                panic!("interactive Whisper must not use beam search")
             }
-            SamplingStrategy::Greedy { .. } => panic!("Whisper must use beam search"),
         }
     }
 

@@ -29,12 +29,14 @@ pub enum RuntimeEvent {
 #[derive(Debug)]
 enum ControllerCommand {
     Shortcut(ShortcutEvent),
+    ProcessingFinished(Result<VoiceProcessingResult, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureMode {
     Idle,
     Trigger,
+    Processing,
 }
 
 fn shortcut_command(event: ShortcutEvent) -> ControllerCommand {
@@ -82,6 +84,7 @@ impl RuntimeController {
 
         runtime.spawn(run_command_loop(
             command_rx,
+            command_tx.clone(),
             state.clone(),
             event_tx.clone(),
             audio_level_mode_tx,
@@ -143,6 +146,7 @@ impl RuntimeController {
 
 async fn run_command_loop(
     mut commands: tokio_mpsc::UnboundedReceiver<ControllerCommand>,
+    command_tx: tokio_mpsc::UnboundedSender<ControllerCommand>,
     state: Arc<AppState>,
     events: Sender<RuntimeEvent>,
     audio_level_mode: watch::Sender<bool>,
@@ -173,17 +177,22 @@ async fn run_command_loop(
                 if capture_mode == CaptureMode::Trigger =>
             {
                 let captured = take_capture_for_processing(State::new(state.as_ref())).await;
-                capture_mode = CaptureMode::Idle;
                 let _ = audio_level_mode.send(false);
 
                 match captured {
                     Err(_) => {
+                        capture_mode = CaptureMode::Idle;
                         let _ = events.send(RuntimeEvent::Error);
                     }
                     Ok(captured) => {
+                        // Only one dictation may own the model at a time. Before
+                        // this guard, repeated shortcut attempts spawned more
+                        // blocking inference workers which queued on the model
+                        // mutex and made shutdown wait for the entire backlog.
+                        capture_mode = CaptureMode::Processing;
                         let _ = events.send(RuntimeEvent::Processing);
                         let task_state = state.clone();
-                        let task_events = events.clone();
+                        let task_commands = command_tx.clone();
                         tokio::spawn(async move {
                             let result =
                                 process_captured_audio(State::new(task_state.as_ref()), captured)
@@ -191,11 +200,19 @@ async fn run_command_loop(
                             let _ = runtime_compute_status::publish(
                                 &task_state.transcription.runtime_status(),
                             );
-                            emit_processing_result(result, &task_events);
+                            let _ =
+                                task_commands.send(ControllerCommand::ProcessingFinished(result));
                         });
                     }
                 }
             }
+            ControllerCommand::ProcessingFinished(result)
+                if capture_mode == CaptureMode::Processing =>
+            {
+                capture_mode = CaptureMode::Idle;
+                emit_processing_result(result, &events);
+            }
+            ControllerCommand::ProcessingFinished(_) => {}
             ControllerCommand::Shortcut(
                 ShortcutEvent::TriggerPressed | ShortcutEvent::TriggerReleased,
             ) => {}
@@ -284,5 +301,11 @@ mod tests {
             shortcut_command(ShortcutEvent::TriggerReleased),
             ControllerCommand::Shortcut(ShortcutEvent::TriggerReleased)
         ));
+    }
+
+    #[test]
+    fn processing_is_a_distinct_capture_mode() {
+        assert_ne!(CaptureMode::Processing, CaptureMode::Idle);
+        assert_ne!(CaptureMode::Processing, CaptureMode::Trigger);
     }
 }
