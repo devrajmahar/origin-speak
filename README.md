@@ -1,6 +1,6 @@
 # Origin Speak
 
-Local, open-source voice-to-text for Windows and macOS. Whisper and Canary-Qwen 2.5B run on your machine; no API key or cloud transcription service is required.
+Local, open-source voice-to-text for Windows and macOS. Whisper, Canary-Qwen 2.5B, and Qwen3-ASR 1.7B run on your machine; no API key or cloud transcription service is required.
 
 ## Install
 
@@ -86,7 +86,7 @@ Origin Speak · Transcription Models
  3  small.en            Small English                —           Available
 …
 
-Models: 11 available · 0 installed · 1 default
+Models: 12 available · 0 installed · 1 default
 
 Actions
   Install or switch model    origin model use <model-id>
@@ -118,7 +118,7 @@ Origin Speak never silently changes the default during removal. Attempting to re
 
 Run `origin model --help` for the complete workflow. The older `download`, `select`/`switch`, and `delete`/`uninstall` spellings remain accepted as compatibility aliases.
 
-Canary-Qwen 2.5B is English-only. Whisper models include English-only and multilingual variants.
+Canary-Qwen 2.5B is English-only. Qwen3-ASR 1.7B and the multilingual Whisper variants support the configured source language or automatic detection. The default remains `base.en`.
 
 ## Check whether transcription is actually using GPU or CPU
 
@@ -133,7 +133,7 @@ GPU example:
 ```text
 Origin Speak · Model Status
 
-Default model    canary-qwen-2.5b
+Default model    base.en
 Installed        Yes
 GPU preference   enabled
 Active compute   GPU

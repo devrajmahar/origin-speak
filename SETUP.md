@@ -1,6 +1,6 @@
 # Origin Speak Setup
 
-Origin Speak is a local voice-to-text product with two native Rust executables: the `origin` CLI manager and the silent resident `origin-runtime`. The runtime captures microphone audio, transcribes with local Whisper or Canary-Qwen, delivers text to the focused application, and shows only a compact status overlay. Configuration and model management belong to the CLI.
+Origin Speak is a local voice-to-text product with two native Rust executables: the `origin` CLI manager and the silent resident `origin-runtime`. The runtime captures microphone audio, transcribes with local Whisper, Canary-Qwen, or Qwen3-ASR, delivers text to the focused application, and shows only a compact status overlay. Configuration and model management belong to the CLI.
 
 No Electron/React/Node.js runtime, browser/WebView, local HTTP server, cloud transcription service, dashboard, settings window, or assistant mode is required.
 
@@ -74,7 +74,7 @@ Model table row numbers are display-only. Use the stable ID in the `MODEL` colum
 
 On Windows, `origin update` may report that installation is scheduled because the running `origin.exe` cannot replace itself. The post-exit helper records the final result durably; the next `origin status` or update command reports whether that replacement completed or failed.
 
-Local transcription needs no API key. Origin Speak supports its whisper.cpp catalog plus the English-only `canary-qwen-2.5b` model through the native transcribe.cpp runtime. Model downloads are pinned to immutable upstream revisions and verified with exact artifact metadata and SHA-256 before installation. Safe interrupted downloads retain a valid `.part` file and resume with HTTP Range when the server supports it. Resume starts from the persisted byte count without re-hashing an incomplete multi-gigabyte partial first; once transfer completes, the CLI switches to an explicit SHA-256 verification phase.
+Local transcription needs no API key. Origin Speak supports its whisper.cpp catalog plus the English-only `canary-qwen-2.5b` and multilingual `qwen3-asr-1.7b` models through the native transcribe.cpp runtime. Model downloads are pinned to immutable upstream revisions and verified with exact artifact metadata and SHA-256 before installation. Safe interrupted downloads retain a valid `.part` file and resume with HTTP Range when the server supports it. Resume starts from the persisted byte count without re-hashing an incomplete multi-gigabyte partial first; once transfer completes, the CLI switches to an explicit SHA-256 verification phase.
 
 ## Default dictation hotkey
 

@@ -15,6 +15,12 @@ const SUPPORTED_SOURCE_LANGUAGES: &[&str] = &[
     "auto", "en", "hi", "es", "fr", "de", "it", "pt", "ru", "zh", "ja", "ko", "ar",
 ];
 
+pub fn log_capture_lifecycle_timing(metric: &str, elapsed_ms: u128) {
+    log::info!("Audio capture timing: {metric}_ms={elapsed_ms}");
+    #[cfg(debug_assertions)]
+    eprintln!("[Origin Speak timing] capture {metric}_ms={elapsed_ms}");
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionResult {
     pub text: String,
@@ -63,10 +69,6 @@ fn is_low_signal_capture(rms: f32, peak: f32, active_ratio: f32) -> bool {
         .filter(|weak| *weak)
         .count();
     weak_metrics >= 2
-}
-
-fn clean_transcription_for_delivery(text: &str) -> String {
-    text.trim().to_string()
 }
 
 fn should_suppress_stock_hallucination(text: &str, rms: f32, peak: f32, active_ratio: f32) -> bool {
@@ -156,6 +158,7 @@ pub async fn take_capture_for_processing(
     state.streamer.lock().await.stop_streaming();
     *state.is_processing.lock().await = true;
     let streamer = state.streamer.lock().await;
+    streamer.log_capture_timing();
     Ok(CapturedAudio {
         samples: streamer.get_accumulated_samples(),
         sample_rate: streamer.current_sample_rate(),
@@ -171,6 +174,10 @@ pub async fn process_captured_audio(
         samples,
         sample_rate,
     } = captured;
+
+    if crate::transcription::debug_audio_enabled() {
+        crate::transcription::dump_debug_audio(samples.clone(), sample_rate).await;
+    }
 
     let rms = if samples.is_empty() {
         0.0
@@ -216,10 +223,12 @@ pub async fn process_captured_audio(
     let transcription_started = Instant::now();
     let text = match state
         .transcription
-        .transcribe(samples, sample_rate, language, dictionary_hints)
+        .transcribe(samples, sample_rate, language.clone(), dictionary_hints)
         .await
     {
-        Ok(text) => clean_transcription_for_delivery(&text),
+        Ok(text) => {
+            crate::transcription::format_transcription_for_delivery(&text, language.as_deref())
+        }
         Err(error) => {
             state.error_log.lock().await.log_error_with_details(
                 crate::error_log::ErrorType::Transcription,
@@ -817,10 +826,13 @@ mod tests {
     }
 
     #[test]
-    fn dictation_cleanup_only_trims_outer_whitespace() {
+    fn dictation_cleanup_formats_conservative_english_output() {
         assert_eq!(
-            clean_transcription_for_delivery("  open settings and delete nothing, please.  \n"),
-            "open settings and delete nothing, please."
+            crate::transcription::format::format_transcription(
+                "  open settings and delete nothing ,please  \n",
+                Some("en")
+            ),
+            "Open settings and delete nothing, please."
         );
     }
 

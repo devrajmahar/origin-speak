@@ -14,12 +14,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone)]
 struct RuntimeMetrics {
     sample_rate_hz: u32,
+    capture_requested_ms: u64,
+    stream_started_ms: u64,
+    first_callback_ms: u64,
 }
 
 impl Default for RuntimeMetrics {
     fn default() -> Self {
         Self {
             sample_rate_hz: SAMPLE_RATE,
+            capture_requested_ms: 0,
+            stream_started_ms: 0,
+            first_callback_ms: 0,
         }
     }
 }
@@ -205,6 +211,11 @@ impl AudioStreamer {
         if let Ok(mut samples) = self.accumulated_samples.lock() {
             samples.clear();
         }
+        if let Ok(mut metrics) = self.runtime.lock() {
+            metrics.capture_requested_ms = now_millis();
+            metrics.stream_started_ms = 0;
+            metrics.first_callback_ms = 0;
+        }
         self.live_level_bits
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
         self.is_recording.store(true, Ordering::SeqCst);
@@ -348,6 +359,26 @@ impl AudioStreamer {
             .map(|runtime| runtime.sample_rate_hz)
             .unwrap_or(SAMPLE_RATE)
     }
+
+    pub fn log_capture_timing(&self) {
+        if let Ok(metrics) = self.runtime.lock() {
+            let request_to_stream = metrics
+                .stream_started_ms
+                .saturating_sub(metrics.capture_requested_ms);
+            let stream_to_first = metrics
+                .first_callback_ms
+                .saturating_sub(metrics.stream_started_ms);
+            let request_to_first = metrics
+                .first_callback_ms
+                .saturating_sub(metrics.capture_requested_ms);
+            log::info!(
+                "Audio capture timing: request_to_stream_started_ms={}, stream_started_to_first_callback_ms={}, request_to_first_callback_ms={}",
+                request_to_stream,
+                stream_to_first,
+                request_to_first
+            );
+        }
+    }
 }
 
 fn run_capture_owner(
@@ -386,6 +417,7 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -395,6 +427,7 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
+                        callback_runtime.clone(),
                     );
                 },
                 move |error| record_stream_error(error.to_string()),
@@ -405,6 +438,7 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -418,6 +452,7 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
+                        callback_runtime.clone(),
                     );
                 },
                 move |error| record_stream_error(error.to_string()),
@@ -428,6 +463,7 @@ fn run_capture_owner(
             let callback_recording = is_recording.clone();
             let callback_accumulated = accumulated.clone();
             let callback_level = live_level.clone();
+            let callback_runtime = runtime.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -441,6 +477,7 @@ fn run_capture_owner(
                         callback_recording.clone(),
                         callback_accumulated.clone(),
                         callback_level.clone(),
+                        callback_runtime.clone(),
                     );
                 },
                 move |error| record_stream_error(error.to_string()),
@@ -453,6 +490,9 @@ fn run_capture_owner(
         format!("Failed to build audio stream: {error}. Check microphone permissions.")
     })?;
 
+    if let Ok(mut metrics) = runtime.lock() {
+        metrics.stream_started_ms = now_millis();
+    }
     stream
         .play()
         .map_err(|error| format!("Failed to start audio stream: {error}"))?;
@@ -484,19 +524,20 @@ fn process_input_data(
     is_recording: Arc<AtomicBool>,
     accumulated: Arc<Mutex<Vec<f32>>>,
     live_level: Arc<AtomicU32>,
+    runtime: Arc<Mutex<RuntimeMetrics>>,
 ) {
     if !is_recording.load(Ordering::SeqCst) {
         live_level.store(0.0_f32.to_bits(), Ordering::Relaxed);
         return;
     }
 
-    let mono = if channels <= 1 {
-        data.to_vec()
-    } else {
-        data.chunks(channels as usize)
-            .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
-            .collect::<Vec<_>>()
-    };
+    if let Ok(mut metrics) = runtime.lock() {
+        if metrics.first_callback_ms == 0 {
+            metrics.first_callback_ms = now_millis();
+        }
+    }
+
+    let mono = crate::transcription::preprocess::downmix_interleaved(data, channels as usize);
 
     if !mono.is_empty() {
         let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
@@ -567,6 +608,7 @@ mod tests {
         let callback_recording = is_recording.clone();
         let callback_accumulated = accumulated.clone();
         let callback_level = live_level.clone();
+        let callback_runtime = Arc::new(Mutex::new(RuntimeMetrics::default()));
         let callback = thread::spawn(move || {
             entered_tx.send(()).expect("signal callback entry");
             process_input_data(
@@ -575,6 +617,7 @@ mod tests {
                 callback_recording,
                 callback_accumulated,
                 callback_level,
+                callback_runtime,
             );
             completed_tx.send(()).expect("signal callback completion");
         });

@@ -986,11 +986,21 @@ mod tests {
                 false,
                 Some(2_797_548_928),
             ),
+            model(
+                "qwen3-asr-1.7b",
+                "Qwen3-ASR 1.7B (Q8)",
+                false,
+                false,
+                false,
+                Some(2_185_030_624),
+            ),
         ];
         let output = render_model_table(&models, 48);
         assert!(output.contains(" 1  base.en"));
         assert!(output.contains(" 2  canary-qwen-2.5b"));
+        assert!(output.contains(" 3  qwen3-asr-1.7b"));
         assert!(output.contains("Canary-Qwen 2.5B (Q8) · 2.61 GiB"));
+        assert!(output.contains("Qwen3-ASR 1.7B (Q8) · 2.03 GiB"));
     }
 
     #[test]

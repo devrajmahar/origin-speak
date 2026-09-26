@@ -7,14 +7,15 @@ use std::time::Duration;
 use crate::runtime_compute_status;
 use origin_speak_lib::{
     AppState, DeliveryPhase, ShortcutEvent, ShortcutService, State, VoiceProcessingResult,
-    get_audio_level, normalize_hotkey_string, process_captured_audio, start_listening,
-    take_capture_for_processing,
+    get_audio_level, log_capture_lifecycle_timing, normalize_hotkey_string, process_captured_audio,
+    start_listening, take_capture_for_processing,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc as tokio_mpsc, watch};
 
 const AUDIO_LEVEL_INTERVAL: Duration = Duration::from_millis(45);
 const MODEL_PREWARM_DELAY: Duration = Duration::from_secs(8);
+const CAPTURE_RELEASE_HANGOVER: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RuntimeEvent {
@@ -29,6 +30,7 @@ pub enum RuntimeEvent {
 #[derive(Debug)]
 enum ControllerCommand {
     Shortcut(ShortcutEvent),
+    FinishCapture(std::time::Instant),
     ProcessingFinished(Result<VoiceProcessingResult, String>),
 }
 
@@ -158,11 +160,16 @@ async fn run_command_loop(
             ControllerCommand::Shortcut(ShortcutEvent::TriggerPressed)
                 if capture_mode == CaptureMode::Idle =>
             {
+                let pressed_at = std::time::Instant::now();
                 // Do not expose Listening until CPAL has actually acquired and
                 // started the input stream. This prevents a false listening
                 // flash when the device is unavailable or permission is denied.
                 match start_listening(State::new(state.as_ref())).await {
                     Ok(_) => {
+                        log_capture_lifecycle_timing(
+                            "trigger_pressed_to_stream_started",
+                            pressed_at.elapsed().as_millis(),
+                        );
                         capture_mode = CaptureMode::Trigger;
                         let _ = audio_level_mode.send(true);
                         let _ = events.send(RuntimeEvent::Listening);
@@ -176,21 +183,33 @@ async fn run_command_loop(
             ControllerCommand::Shortcut(ShortcutEvent::TriggerReleased)
                 if capture_mode == CaptureMode::Trigger =>
             {
-                let captured = take_capture_for_processing(State::new(state.as_ref())).await;
                 let _ = audio_level_mode.send(false);
-
+                // The overlay changes immediately, while capture remains live
+                // briefly so a key-up cannot clip the final syllable.
+                capture_mode = CaptureMode::Processing;
+                let _ = events.send(RuntimeEvent::Processing);
+                let released_at = std::time::Instant::now();
+                let finish_commands = command_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CAPTURE_RELEASE_HANGOVER).await;
+                    let _ = finish_commands.send(ControllerCommand::FinishCapture(released_at));
+                });
+            }
+            ControllerCommand::FinishCapture(released_at)
+                if capture_mode == CaptureMode::Processing =>
+            {
+                let captured = take_capture_for_processing(State::new(state.as_ref())).await;
+                log_capture_lifecycle_timing(
+                    "trigger_released_to_capture_stopped",
+                    released_at.elapsed().as_millis(),
+                );
                 match captured {
                     Err(_) => {
                         capture_mode = CaptureMode::Idle;
                         let _ = events.send(RuntimeEvent::Error);
                     }
                     Ok(captured) => {
-                        // Only one dictation may own the model at a time. Before
-                        // this guard, repeated shortcut attempts spawned more
-                        // blocking inference workers which queued on the model
-                        // mutex and made shutdown wait for the entire backlog.
-                        capture_mode = CaptureMode::Processing;
-                        let _ = events.send(RuntimeEvent::Processing);
+                        // Only one dictation may own the model at a time.
                         let task_state = state.clone();
                         let task_commands = command_tx.clone();
                         tokio::spawn(async move {
@@ -206,6 +225,7 @@ async fn run_command_loop(
                     }
                 }
             }
+            ControllerCommand::FinishCapture(_) => {}
             ControllerCommand::ProcessingFinished(result)
                 if capture_mode == CaptureMode::Processing =>
             {
@@ -218,6 +238,11 @@ async fn run_command_loop(
             ) => {}
         }
     }
+}
+
+#[cfg(test)]
+fn release_hangover() -> Duration {
+    CAPTURE_RELEASE_HANGOVER
 }
 
 fn emit_processing_result(
@@ -307,5 +332,10 @@ mod tests {
     fn processing_is_a_distinct_capture_mode() {
         assert_ne!(CaptureMode::Processing, CaptureMode::Idle);
         assert_ne!(CaptureMode::Processing, CaptureMode::Trigger);
+    }
+
+    #[test]
+    fn release_hangover_is_long_enough_for_trailing_syllables() {
+        assert_eq!(release_hangover(), Duration::from_millis(250));
     }
 }

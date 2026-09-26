@@ -30,8 +30,9 @@ pub use paths::{
 };
 pub use shortcuts::{ShortcutEvent, ShortcutService};
 pub use transcription::{
-    LocalModelInfo, TranscriptionComputeBackend, TranscriptionRuntimePhase,
-    TranscriptionRuntimeStatus, TranscriptionService, TranscriptionSettings,
+    downmix_audio_for_transcription, format_transcription_for_delivery, LocalModelInfo,
+    TranscriptionComputeBackend, TranscriptionRuntimePhase, TranscriptionRuntimeStatus,
+    TranscriptionService, TranscriptionSettings,
 };
 
 /// Keep native transcribe.cpp device-registration logs out of user-facing CLI

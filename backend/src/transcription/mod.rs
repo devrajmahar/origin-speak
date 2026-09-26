@@ -1,5 +1,8 @@
-mod canary_qwen;
+mod debug_audio;
+pub(crate) mod format;
+pub(crate) mod preprocess;
 mod resampler;
+mod transcribe_cpp;
 
 use futures_util::StreamExt;
 use reqwest::{
@@ -27,6 +30,33 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const MIN_MODEL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_MODEL_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+pub fn format_transcription_for_delivery(text: &str, language: Option<&str>) -> String {
+    format::format_transcription(text, language)
+}
+
+pub fn downmix_audio_for_transcription(samples: &[f32], channels: usize) -> Vec<f32> {
+    preprocess::downmix_interleaved(samples, channels)
+}
+
+pub(crate) fn debug_audio_enabled() -> bool {
+    debug_audio::enabled()
+}
+
+pub(crate) async fn dump_debug_audio(samples: Vec<f32>, sample_rate: u32) {
+    let result = tokio::task::spawn_blocking(move || {
+        let resampled = resampler::resample_buffer(&samples, sample_rate, WHISPER_SAMPLE_RATE)?;
+        let model_input = preprocess::condition_audio(&resampled, WHISPER_SAMPLE_RATE);
+        debug_audio::dump_pair_if_enabled(&samples, sample_rate, &model_input, WHISPER_SAMPLE_RATE);
+        Ok::<(), String>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("Could not prepare debug audio capture: {error}"),
+        Err(error) => log::warn!("Debug audio worker failed: {error}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifiedModelIdentity {
     len: u64,
@@ -42,7 +72,7 @@ static SHA256_FILE_CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::n
 #[derive(Debug, Clone, Copy)]
 enum ModelBackend {
     Whisper,
-    CanaryQwen,
+    TranscribeCpp(transcribe_cpp::Family),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,8 +226,20 @@ const MODELS: &[ModelSpec] = &[
         tier: "canary-qwen-2.5b",
         english_only: true,
         recommended: false,
-        backend: ModelBackend::CanaryQwen,
+        backend: ModelBackend::TranscribeCpp(transcribe_cpp::Family::CanaryQwen),
         expected_bytes: Some(2_797_548_928),
+    },
+    ModelSpec {
+        id: "qwen3-asr-1.7b",
+        label: "Qwen3-ASR 1.7B (Q8)",
+        filename: "Qwen3-ASR-1.7B-Q8_0.gguf",
+        revision: "3555bd238a8572bbace3ebf60d23b036dc0a5dbe",
+        sha256: "9a0d81792dfea2d5f278b8a63deb3ea6e02139ce42c2301f32ea19c4f77526b7",
+        tier: "qwen3-asr-1.7b",
+        english_only: false,
+        recommended: false,
+        backend: ModelBackend::TranscribeCpp(transcribe_cpp::Family::Qwen3Asr),
+        expected_bytes: Some(2_185_030_624),
     },
 ];
 
@@ -341,7 +383,7 @@ struct LoadedModel {
 
 enum LoadedRuntime {
     Whisper(WhisperContext),
-    CanaryQwen(canary_qwen::Runtime),
+    TranscribeCpp(transcribe_cpp::Runtime),
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +449,26 @@ impl TranscriptionService {
             loaded: Arc::new(Mutex::new(None)),
             gpu_enabled: Arc::new(AtomicBool::new(gpu_enabled)),
         }
+    }
+
+    /// Construct an isolated service for the offline evaluator without
+    /// changing the user's persisted model selection.
+    pub fn for_evaluation(model: &str, gpu_enabled: bool) -> Result<Self, String> {
+        let normalized = model.trim();
+        model_spec(normalized)
+            .ok_or_else(|| format!("Unknown local transcription model: {normalized}"))?;
+        let settings = TranscriptionSettings {
+            model: normalized.to_string(),
+        };
+        let status = status_for_model(normalized, None, gpu_enabled, None);
+        Ok(Self {
+            settings: Arc::new(Mutex::new(settings)),
+            runtime: Arc::new(Mutex::new(status)),
+            download_runtime: Arc::new(Mutex::new(None)),
+            download_guard: Arc::new(tokio::sync::Mutex::new(())),
+            loaded: Arc::new(Mutex::new(None)),
+            gpu_enabled: Arc::new(AtomicBool::new(gpu_enabled)),
+        })
     }
 
     pub fn gpu_enabled(&self) -> bool {
@@ -749,7 +811,8 @@ impl TranscriptionService {
         let task = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let total_started = Instant::now();
             let resample_started = Instant::now();
-            let audio = resampler::resample_buffer(&samples, sample_rate, WHISPER_SAMPLE_RATE)?;
+            let resampled = resampler::resample_buffer(&samples, sample_rate, WHISPER_SAMPLE_RATE)?;
+            let audio = preprocess::condition_audio(&resampled, WHISPER_SAMPLE_RATE);
             let resample_ms = resample_started.elapsed().as_millis();
             if audio.is_empty() {
                 return Ok(String::new());
@@ -1170,7 +1233,9 @@ fn status_for_model(
     let planned_backend = model_spec(model)
         .map(|spec| match spec.backend {
             ModelBackend::Whisper => select_backend(gpu_requested),
-            ModelBackend::CanaryQwen => canary_qwen::planned_backend(gpu_requested),
+            ModelBackend::TranscribeCpp(family) => {
+                transcribe_cpp::planned_backend(gpu_requested, family)
+            }
         })
         .unwrap_or_else(|| select_backend(gpu_requested));
     let active_backend = loaded_backend.map(|backend| backend.active);
@@ -1209,9 +1274,11 @@ fn model_url(spec: &ModelSpec) -> String {
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/{}/{}",
             spec.revision, spec.filename
         ),
-        ModelBackend::CanaryQwen => format!(
-            "https://huggingface.co/handy-computer/canary-qwen-2.5b-gguf/resolve/{}/{}",
-            spec.revision, spec.filename
+        ModelBackend::TranscribeCpp(family) => format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            family.repository(),
+            spec.revision,
+            spec.filename
         ),
     }
 }
@@ -1271,7 +1338,7 @@ fn validate_model_file(
         .map_err(|error| format!("could not read model header: {error}"))?;
     let expected_magic = match spec.backend {
         ModelBackend::Whisper => GGML_MAGIC,
-        ModelBackend::CanaryQwen => GGUF_MAGIC,
+        ModelBackend::TranscribeCpp(_) => GGUF_MAGIC,
     };
     if magic != expected_magic {
         return Err(format!(
@@ -1499,7 +1566,7 @@ fn partial_download_len(path: &Path, spec: &ModelSpec) -> Result<u64, String> {
             .map_err(|error| format!("could not inspect partial model header: {error}"))?;
         let expected_magic = match spec.backend {
             ModelBackend::Whisper => GGML_MAGIC,
-            ModelBackend::CanaryQwen => GGUF_MAGIC,
+            ModelBackend::TranscribeCpp(_) => GGUF_MAGIC,
         };
         if magic != expected_magic {
             remove_model_leaf_no_follow(path)?;
@@ -1604,14 +1671,14 @@ fn load_model(
     let spec =
         *model_spec(model).ok_or_else(|| format!("Unknown local transcription model: {model}"))?;
     validate_model_integrity(path, &spec, None)?;
-    if matches!(spec.backend, ModelBackend::CanaryQwen) {
-        let (runtime, backend) = canary_qwen::Runtime::load(path, gpu_requested)?;
+    if let ModelBackend::TranscribeCpp(family) = spec.backend {
+        let (runtime, backend) = transcribe_cpp::Runtime::load(path, gpu_requested, family)?;
         log_loaded_backend(model, gpu_requested, &backend);
         *loaded = Some(LoadedModel {
             id: model.to_string(),
             gpu_requested,
             backend,
-            runtime: LoadedRuntime::CanaryQwen(runtime),
+            runtime: LoadedRuntime::TranscribeCpp(runtime),
         });
         return Ok(());
     }
@@ -1715,51 +1782,58 @@ fn run_loaded_inference(
         .ok_or_else(|| "Local transcription model was not loaded".to_string())?
         .backend
         .clone();
-    let is_canary = matches!(
+    let is_transcribe_cpp = matches!(
         loaded.as_ref().map(|loaded| &loaded.runtime),
-        Some(LoadedRuntime::CanaryQwen(_))
+        Some(LoadedRuntime::TranscribeCpp(_))
     );
 
-    if is_canary {
+    if is_transcribe_cpp {
+        let family = match model_spec(model).map(|spec| spec.backend) {
+            Some(ModelBackend::TranscribeCpp(family)) => family,
+            _ => return Err("Transcribe.cpp runtime has no matching model family".to_string()),
+        };
+        let family_name = family.display_name();
         let initial = match loaded.as_mut() {
             Some(LoadedModel {
-                runtime: LoadedRuntime::CanaryQwen(runtime),
+                runtime: LoadedRuntime::TranscribeCpp(runtime),
                 ..
-            }) => runtime.transcribe(audio, dictionary_hints),
-            _ => unreachable!("Canary runtime discriminator changed"),
+            }) => runtime.transcribe(audio, language, dictionary_hints),
+            _ => unreachable!("transcribe.cpp runtime discriminator changed"),
         };
         return match initial {
             Ok(text) => Ok(text),
             Err(error)
                 if initial_backend.active == TranscriptionComputeBackend::Gpu
-                    && canary_qwen::should_retry_on_cpu(&error) =>
+                    && transcribe_cpp::should_retry_on_cpu(&error) =>
             {
                 let error = error.to_string();
                 log::warn!(
-                    "GPU Canary-Qwen inference failed for '{}': {}. Reloading on CPU and retrying once.",
+                    "GPU {} inference failed for '{}': {}. Reloading on CPU and retrying once.",
+                    family_name,
                     model,
                     error
                 );
-                load_canary_cpu_after_gpu_inference_failure(
+                load_transcribe_cpp_cpu_after_gpu_inference_failure(
                     loaded,
                     model,
                     path,
                     gpu_requested,
+                    family,
                     &error,
                 )?;
                 match loaded.as_mut() {
                     Some(LoadedModel {
-                        runtime: LoadedRuntime::CanaryQwen(runtime),
+                        runtime: LoadedRuntime::TranscribeCpp(runtime),
                         ..
-                    }) => runtime.transcribe(audio, dictionary_hints).map_err(|cpu_error| {
+                    }) => runtime.transcribe(audio, language, dictionary_hints).map_err(|cpu_error| {
                         format!(
-                            "GPU Canary-Qwen inference failed ({error}); CPU fallback retry failed: {cpu_error}"
+                            "GPU {family_name} inference failed ({error}); CPU fallback retry failed: {cpu_error}"
                         )
                     }),
-                    _ => Err("CPU Canary-Qwen fallback runtime was not loaded".to_string()),
+                    _ => Err(format!("CPU {family_name} fallback runtime was not loaded")),
                 }
             }
-            Err(error) => Err(format!("Canary-Qwen inference failed: {error}")),
+            Err(error) => Err(format!("{family_name} inference failed: {error}")),
         };
     }
 
@@ -1866,25 +1940,22 @@ fn whisper_sampling_strategy() -> SamplingStrategy {
 }
 
 fn recognition_prompt(hints: &[(String, Option<String>)]) -> String {
-    hints
+    let words = hints
         .iter()
-        .filter_map(|(word, phonetic)| {
+        .filter_map(|(word, _phonetic)| {
             let word = word.trim();
             if word.is_empty() {
                 return None;
             }
-            let phonetic = phonetic
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            Some(match phonetic {
-                Some(phonetic) => format!("{word} (pronounced {phonetic})"),
-                None => word.to_string(),
-            })
+            Some(word.to_string())
         })
         .take(20)
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        String::new()
+    } else {
+        format!("Vocabulary: {}.", words.join(", "))
+    }
 }
 
 fn should_retry_inference_on_cpu(
@@ -1932,26 +2003,28 @@ fn load_cpu_after_gpu_inference_failure(
     Ok(())
 }
 
-fn load_canary_cpu_after_gpu_inference_failure(
+fn load_transcribe_cpp_cpu_after_gpu_inference_failure(
     loaded: &mut Option<LoadedModel>,
     model: &str,
     path: &Path,
     gpu_requested: bool,
+    family: transcribe_cpp::Family,
     gpu_error: &str,
 ) -> Result<(), String> {
-    let (runtime, mut backend) = canary_qwen::Runtime::load(path, false).map_err(|cpu_error| {
+    let family_name = family.display_name();
+    let (runtime, mut backend) = transcribe_cpp::Runtime::load(path, false, family).map_err(|cpu_error| {
         format!(
-            "GPU Canary-Qwen inference failed ({gpu_error}); failed to load CPU fallback model ({cpu_error})"
+            "GPU {family_name} inference failed ({gpu_error}); failed to load CPU fallback model ({cpu_error})"
         )
     })?;
     backend.fallback_reason = Some(format!(
-        "GPU Canary-Qwen inference failed ({gpu_error}). Retried on CPU."
+        "GPU {family_name} inference failed ({gpu_error}). Retried on CPU."
     ));
     *loaded = Some(LoadedModel {
         id: model.to_string(),
         gpu_requested,
         backend,
-        runtime: LoadedRuntime::CanaryQwen(runtime),
+        runtime: LoadedRuntime::TranscribeCpp(runtime),
     });
     Ok(())
 }
@@ -2233,7 +2306,27 @@ mod tests {
         );
         assert_eq!(spec.expected_bytes, Some(2_797_548_928));
         assert!(spec.english_only);
-        assert!(matches!(spec.backend, ModelBackend::CanaryQwen));
+        assert!(matches!(
+            spec.backend,
+            ModelBackend::TranscribeCpp(transcribe_cpp::Family::CanaryQwen)
+        ));
+    }
+
+    #[test]
+    fn qwen3_asr_catalog_pins_native_q8_gguf() {
+        let spec = model_spec("qwen3-asr-1.7b").expect("Qwen3-ASR catalog model");
+        assert_eq!(spec.filename, "Qwen3-ASR-1.7B-Q8_0.gguf");
+        assert_eq!(spec.revision, "3555bd238a8572bbace3ebf60d23b036dc0a5dbe");
+        assert_eq!(
+            spec.sha256,
+            "9a0d81792dfea2d5f278b8a63deb3ea6e02139ce42c2301f32ea19c4f77526b7"
+        );
+        assert_eq!(spec.expected_bytes, Some(2_185_030_624));
+        assert!(!spec.english_only);
+        assert!(matches!(
+            spec.backend,
+            ModelBackend::TranscribeCpp(transcribe_cpp::Family::Qwen3Asr)
+        ));
     }
 
     #[test]
@@ -2333,6 +2426,11 @@ mod tests {
                 "df576c1641eb59bb66bc3c396bbdd8b0b113825a",
                 "d89aad1285d5bd5aa441c464d3a4cf37bd5474f70705408e71558d8627415b34",
             ),
+            (
+                "qwen3-asr-1.7b",
+                "3555bd238a8572bbace3ebf60d23b036dc0a5dbe",
+                "9a0d81792dfea2d5f278b8a63deb3ea6e02139ce42c2301f32ea19c4f77526b7",
+            ),
         ];
         for (id, revision, sha256) in expected {
             let spec = model_spec(id).expect("catalog model");
@@ -2426,6 +2524,15 @@ mod tests {
         assert_eq!(
             model_url(spec),
             "https://huggingface.co/handy-computer/canary-qwen-2.5b-gguf/resolve/df576c1641eb59bb66bc3c396bbdd8b0b113825a/canary-qwen-2.5b-Q8_0.gguf"
+        );
+    }
+
+    #[test]
+    fn qwen3_model_url_is_immutable_and_points_to_native_q8_artifact() {
+        let spec = model_spec("qwen3-asr-1.7b").unwrap();
+        assert_eq!(
+            model_url(spec),
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/3555bd238a8572bbace3ebf60d23b036dc0a5dbe/Qwen3-ASR-1.7B-Q8_0.gguf"
         );
     }
 
@@ -2618,6 +2725,8 @@ mod tests {
         assert!(validate_model_language("base.en", Some("en-US")).is_ok());
         assert!(validate_model_language("base.en", Some("auto")).is_ok());
         assert!(validate_model_language("base", Some("hi")).is_ok());
+        assert!(validate_model_language("qwen3-asr-1.7b", Some("hi")).is_ok());
+        assert!(validate_model_language("qwen3-asr-1.7b", Some("auto")).is_ok());
 
         let error = validate_model_language("base.en", Some("hi"))
             .expect_err("English-only model must reject Hindi");
@@ -2634,7 +2743,7 @@ mod tests {
     }
 
     #[test]
-    fn whisper_recognition_prompt_preserves_optional_pronunciations() {
+    fn whisper_recognition_prompt_is_sentence_cased_and_omits_pronunciations() {
         let hints = vec![
             ("AxiusFlow".to_string(), Some("ax-ee-us flow".to_string())),
             ("Rithmic".to_string(), None),
@@ -2642,7 +2751,7 @@ mod tests {
         ];
         assert_eq!(
             recognition_prompt(&hints),
-            "AxiusFlow (pronounced ax-ee-us flow), Rithmic"
+            "Vocabulary: AxiusFlow, Rithmic."
         );
     }
 
