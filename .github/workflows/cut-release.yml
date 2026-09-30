@@ -40,5 +40,8 @@ jobs:
           git push origin HEAD
           git push origin "v${VERSION}"
 
-      - name: Explain publication handoff
-        run: echo "Tag v${{ inputs.version }} triggers release.yml, which publishes the canonical GitHub Release assets."
+      - name: Start native package publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh workflow run release.yml --ref main -f "version=$VERSION"
