@@ -12,6 +12,7 @@ pub(crate) fn format_transcription(text: &str, language: Option<&str>) -> String
     });
     if english_rules {
         text = remove_fillers_and_stutters(&text);
+        text = normalize_spoken_numbers(&text);
     }
     text = normalize_punctuation_spacing(&text);
     if english_rules {
@@ -23,6 +24,151 @@ pub(crate) fn format_transcription(text: &str, language: Option<&str>) -> String
         }
     }
     text
+}
+
+struct NumberToken<'a> {
+    prefix: &'a str,
+    word: &'a str,
+    suffix: &'a str,
+}
+
+fn number_token(token: &str) -> NumberToken<'_> {
+    let without_prefix = token.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic());
+    let prefix_len = token.len() - without_prefix.len();
+    let word = without_prefix.trim_end_matches(|ch: char| !ch.is_ascii_alphabetic());
+    NumberToken {
+        prefix: &token[..prefix_len],
+        word,
+        suffix: &without_prefix[word.len()..],
+    }
+}
+
+fn following_word<'a>(tokens: &'a [NumberToken<'_>], index: usize) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    if index > 0 && (!tokens[index - 1].suffix.is_empty() || !token.prefix.is_empty()) {
+        return None;
+    }
+    Some(token.word)
+}
+
+fn small_number(word: &str) -> Option<u64> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "zero" => 0,
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        "thirteen" => 13,
+        "fourteen" => 14,
+        "fifteen" => 15,
+        "sixteen" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
+        _ => return None,
+    })
+}
+
+fn tens_number(word: &str) -> Option<u64> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "twenty" => 20,
+        "thirty" => 30,
+        "forty" => 40,
+        "fifty" => 50,
+        "sixty" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
+        _ => return None,
+    })
+}
+
+fn under_hundred(tokens: &[NumberToken<'_>], start: usize) -> Option<(u64, usize)> {
+    let first = following_word(tokens, start)?;
+    if let Some(tens) = tens_number(first) {
+        let unit = following_word(tokens, start + 1).and_then(small_number);
+        if let Some(unit @ 1..=9) = unit {
+            return Some((tens + unit, start + 2));
+        }
+        return Some((tens, start + 1));
+    }
+    small_number(first).map(|value| (value, start + 1))
+}
+
+fn number_group(tokens: &[NumberToken<'_>], start: usize) -> Option<(u64, usize)> {
+    let first = following_word(tokens, start)?;
+    if let Some(unit @ 1..=9) = small_number(first) {
+        if following_word(tokens, start + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("hundred"))
+        {
+            let mut next = start + 2;
+            let and =
+                following_word(tokens, next).is_some_and(|word| word.eq_ignore_ascii_case("and"));
+            if and {
+                next += 1;
+            }
+            if let Some((remainder, end)) = under_hundred(tokens, next) {
+                return Some((unit * 100 + remainder, end));
+            }
+            return Some((unit * 100, start + 2));
+        }
+        // In spoken English, "three sixty" commonly means 360.
+        if let Some(tens) = following_word(tokens, start + 1).and_then(tens_number) {
+            let extra = following_word(tokens, start + 2).and_then(small_number);
+            if let Some(extra @ 1..=9) = extra {
+                return Some((unit * 100 + tens + extra, start + 3));
+            }
+            return Some((unit * 100 + tens, start + 2));
+        }
+    }
+    under_hundred(tokens, start)
+}
+
+fn spoken_number(tokens: &[NumberToken<'_>], start: usize) -> Option<(u64, usize)> {
+    let (group, end) = number_group(tokens, start)?;
+    if group > 0
+        && following_word(tokens, end).is_some_and(|word| word.eq_ignore_ascii_case("thousand"))
+    {
+        let mut next = end + 1;
+        if following_word(tokens, next).is_some_and(|word| word.eq_ignore_ascii_case("and")) {
+            next += 1;
+        }
+        if let Some((remainder, remainder_end)) = number_group(tokens, next) {
+            return Some((group * 1000 + remainder, remainder_end));
+        }
+        return Some((group * 1000, end + 1));
+    }
+    Some((group, end))
+}
+
+fn normalize_spoken_numbers(text: &str) -> String {
+    let words: Vec<_> = text.split_whitespace().collect();
+    let tokens: Vec<_> = words.iter().map(|word| number_token(word)).collect();
+    let mut output = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        if let Some((value, end)) = spoken_number(&tokens[index..], 0) {
+            output.push(format!(
+                "{}{}{}",
+                tokens[index].prefix,
+                value,
+                tokens[index + end - 1].suffix
+            ));
+            index += end;
+        } else {
+            output.push(words[index].to_string());
+            index += 1;
+        }
+    }
+    output.join(" ")
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -221,6 +367,40 @@ mod tests {
         assert_eq!(
             format_transcription("are you there?", Some("en")),
             "Are you there?"
+        );
+    }
+
+    #[test]
+    fn writes_spoken_english_numbers_as_digits() {
+        assert_eq!(format_transcription("three sixty", Some("en")), "360");
+        assert_eq!(
+            format_transcription("rotate it three sixty degrees", Some("en")),
+            "Rotate it 360 degrees."
+        );
+        assert_eq!(
+            format_transcription("three hundred and sixty five, then twenty one", Some("en")),
+            "365, then 21."
+        );
+        assert_eq!(
+            format_transcription("one thousand two hundred and five", Some("en")),
+            "1205"
+        );
+        assert_eq!(format_transcription("zero to nine", Some("en")), "0 to 9.");
+    }
+
+    #[test]
+    fn number_formatting_respects_punctuation_and_language() {
+        assert_eq!(
+            format_transcription("three, sixty, ninety.", Some("en")),
+            "3, 60, 90."
+        );
+        assert_eq!(
+            format_transcription("three sixty", Some("fr")),
+            "three sixty"
+        );
+        assert_eq!(
+            format_transcription("version 3.5 is ready", Some("en")),
+            "Version 3.5 is ready."
         );
     }
 }
