@@ -1,5 +1,5 @@
 use crate::runtime::{RuntimeController, RuntimeEvent};
-use crate::state::OverlayState;
+use crate::state::{OverlayState, VoiceLevelTracker};
 use crate::theme::transparent;
 use gpui::{prelude::*, *};
 use std::time::Duration;
@@ -8,6 +8,7 @@ pub struct OriginSpeakApp {
     _runtime: RuntimeController,
     overlay: OverlayState,
     audio_level: f32,
+    voice_level: VoiceLevelTracker,
     status_overlay_window: Option<WindowHandle<crate::overlay::StatusOverlayView>>,
     status_overlay_opening: bool,
     _runtime_bridge: Task<()>,
@@ -60,8 +61,10 @@ impl OriginSpeakApp {
                                     None
                                 }
                                 RuntimeEvent::AudioLevel(level) => {
-                                    this.audio_level = level;
-                                    cx.notify();
+                                    if this.overlay == OverlayState::Listening {
+                                        this.audio_level = this.voice_level.update(level);
+                                        cx.notify();
+                                    }
                                     None
                                 }
                             };
@@ -90,6 +93,7 @@ impl OriginSpeakApp {
             _runtime: runtime,
             overlay: OverlayState::Idle,
             audio_level: 0.0,
+            voice_level: VoiceLevelTracker::default(),
             status_overlay_window: None,
             status_overlay_opening: false,
             _runtime_bridge: runtime_bridge,

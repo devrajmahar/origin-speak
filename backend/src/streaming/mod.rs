@@ -540,22 +540,7 @@ fn process_input_data(
     let mono = crate::transcription::preprocess::downmix_interleaved(data, channels as usize);
 
     if !mono.is_empty() {
-        let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
-        let peak = mono
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0_f32, |acc, value| acc.max(value));
-        let active_ratio =
-            mono.iter().filter(|sample| sample.abs() > 0.012).count() as f32 / mono.len() as f32;
-
-        let raw_level = if rms < 0.0012 && peak < 0.01 {
-            0.0
-        } else {
-            ((rms * 12.0) + (peak * 1.8) + (active_ratio * 2.2))
-                .clamp(0.0, 1.0)
-                .powf(0.9)
-        };
-
+        let raw_level = meter_level(&mono);
         let previous = f32::from_bits(live_level.load(Ordering::Relaxed));
         let smoothed = (previous * 0.22 + raw_level * 0.78).clamp(0.0, 1.0);
         live_level.store(smoothed.to_bits(), Ordering::Relaxed);
@@ -564,6 +549,24 @@ fn process_input_data(
     if let Ok(mut samples) = accumulated.lock() {
         samples.extend_from_slice(&mono);
     }
+}
+
+const METER_FLOOR_DB: f32 = -60.0;
+const METER_CEILING_DB: f32 = -12.0;
+
+/// Block RMS on a linear dBFS scale: 0.0 at -60 dBFS (near-digital silence),
+/// 1.0 at -12 dBFS (loud speech). Room-noise removal is left to the consumer,
+/// which can track the noise floor across blocks.
+fn meter_level(mono: &[f32]) -> f32 {
+    if mono.is_empty() {
+        return 0.0;
+    }
+    let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+    if rms <= f32::EPSILON {
+        return 0.0;
+    }
+    let decibels = 20.0 * rms.log10();
+    ((decibels - METER_FLOOR_DB) / (METER_CEILING_DB - METER_FLOOR_DB)).clamp(0.0, 1.0)
 }
 
 fn now_millis() -> u64 {
@@ -643,5 +646,27 @@ mod tests {
                 "unexpected mono sample {sample}"
             );
         }
+    }
+
+    fn tone(amplitude: f32) -> Vec<f32> {
+        (0..480)
+            .map(|index| amplitude * (index as f32 * 0.13).sin())
+            .collect()
+    }
+
+    #[test]
+    fn meter_level_is_a_monotonic_decibel_scale() {
+        assert_eq!(meter_level(&[]), 0.0);
+        assert_eq!(meter_level(&[0.0; 480]), 0.0);
+        // -66 dBFS RMS is below the meter floor.
+        assert_eq!(meter_level(&tone(0.0007)), 0.0);
+
+        let room = meter_level(&tone(0.004));
+        let quiet_speech = meter_level(&tone(0.02));
+        let speech = meter_level(&tone(0.08));
+        assert!(room < 0.3, "room noise {room}");
+        assert!(quiet_speech > room + 0.2, "quiet speech {quiet_speech}");
+        assert!(speech > quiet_speech + 0.2, "speech {speech}");
+        assert_eq!(meter_level(&tone(1.0)), 1.0);
     }
 }
