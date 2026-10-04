@@ -17,7 +17,7 @@ jobs:
 
   cut-release:
     needs: checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       # Required to dispatch release.yml; tags pushed with GITHUB_TOKEN do not trigger workflows.
