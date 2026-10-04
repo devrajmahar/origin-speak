@@ -44,6 +44,8 @@ const UPDATE_RESULT_FILE: &str = "update-result.jsonl";
 const UPDATE_RESULT_MAX_BYTES: u64 = 256 * 1024;
 #[cfg(target_os = "windows")]
 const UNINSTALL_COMMIT_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(target_os = "windows")]
+const STALE_HELPER_MIN_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct UpdateResultRecord {
@@ -506,6 +508,12 @@ fn main() {
     if let Some(code) = run_internal_helper(&args) {
         std::process::exit(code);
     }
+    #[cfg(target_os = "windows")]
+    remove_stale_post_exit_helpers(
+        &std::env::temp_dir(),
+        std::env::current_exe().ok().as_deref(),
+        STALE_HELPER_MIN_AGE,
+    );
     origin_speak_lib::disable_cli_transcription_logging();
 
     let requested_format = if args.iter().any(|arg| arg == "--json") {
@@ -2157,15 +2165,11 @@ fn run_internal_helper(args: &[OsString]) -> Option<i32> {
 #[cfg(target_os = "windows")]
 fn post_exit_uninstall(args: &[OsString]) -> Result<(), String> {
     let result = post_exit_uninstall_inner(args);
-    let cleanup = schedule_current_helper_delete();
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(format!(
-            "{error}; helper cleanup scheduling also failed: {cleanup_error}"
-        )),
-    }
+    // No manager remains to sweep this helper later. Delete-on-reboot only
+    // succeeds with admin rights; otherwise the copy stays in the temp
+    // directory for Windows' own temp cleanup, which is not an uninstall error.
+    let _ = schedule_current_helper_delete();
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -2186,7 +2190,11 @@ fn post_exit_uninstall_inner(args: &[OsString]) -> Result<(), String> {
         management::remove_installed_manager(&layout).map(|_| ())
     })?;
     management::remove_empty_install_root(&layout)?;
-    schedule_current_helper_delete()?;
+    remove_stale_post_exit_helpers(
+        &std::env::temp_dir(),
+        std::env::current_exe().ok().as_deref(),
+        STALE_HELPER_MIN_AGE,
+    );
     Ok(())
 }
 
@@ -2286,41 +2294,18 @@ fn post_exit_update(args: &[OsString]) -> Result<(), String> {
         .and_then(|value| value.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let apply = post_exit_update_inner(args);
-    let cleanup = schedule_current_helper_delete();
-    let record = match (&apply, &cleanup) {
-        (Ok(()), Ok(())) => UpdateResultRecord {
-            version,
-            status: "completed".to_string(),
-            error: None,
-        },
-        (Ok(()), Err(cleanup_error)) => UpdateResultRecord {
-            version,
-            status: "completed_with_warning".to_string(),
-            error: Some(format!(
-                "update installed, but scheduling helper cleanup failed: {cleanup_error}"
-            )),
-        },
-        (Err(error), Ok(())) => UpdateResultRecord {
-            version,
-            status: "failed".to_string(),
-            error: Some(error.clone()),
-        },
-        (Err(error), Err(cleanup_error)) => UpdateResultRecord {
-            version,
-            status: "failed".to_string(),
-            error: Some(format!(
-                "{error}; scheduling update-helper cleanup also failed: {cleanup_error}"
-            )),
-        },
-    };
-    let result = match (apply, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(format!(
-            "{error}; scheduling update-helper cleanup also failed: {cleanup_error}"
-        )),
+    // This helper's own copy in the temp directory is removed by the next
+    // manager run; see remove_stale_post_exit_helpers.
+    let result = post_exit_update_inner(args);
+    let record = UpdateResultRecord {
+        version,
+        status: if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+        .to_string(),
+        error: result.as_ref().err().cloned(),
     };
     let record_result =
         DataLayout::discover().and_then(|layout| append_update_result(&layout, &record));
@@ -2699,6 +2684,65 @@ fn schedule_current_helper_delete() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn is_post_exit_helper_name(name: &str) -> bool {
+    [
+        "origin-speak-update-helper-",
+        "origin-speak-uninstall-helper-",
+    ]
+    .iter()
+    .any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(".exe"))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    })
+}
+
+/// Removes post-exit helper copies left in `temp_root` by earlier runs. A
+/// helper cannot delete its own running image, and delete-on-reboot needs
+/// admin rights, so finished helpers are swept here instead. Windows refuses
+/// to delete a helper that is still running, and `min_age` skips one whose
+/// copy is still being written.
+#[cfg(target_os = "windows")]
+fn remove_stale_post_exit_helpers(
+    temp_root: &Path,
+    keep: Option<&Path>,
+    min_age: Duration,
+) -> usize {
+    let Ok(entries) = fs::read_dir(temp_root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.is_some_and(|keep| keep == path) {
+            continue;
+        }
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_post_exit_helper_name)
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(not(target_os = "windows"))]
 fn schedule_current_helper_delete() -> Result<(), String> {
     let current = std::env::current_exe()
@@ -3011,6 +3055,62 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(fs::read(&first).unwrap(), b"manager");
         assert_eq!(fs::read(&second).unwrap(), b"manager");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stale_helper_sweep_only_removes_old_finished_helpers() {
+        let root = std::env::temp_dir().join(format!(
+            "origin-speak-helper-sweep-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let helper = |kind: &str| {
+            root.join(format!(
+                "origin-speak-{kind}-helper-{}.exe",
+                uuid::Uuid::new_v4()
+            ))
+        };
+        let age = |path: &Path| {
+            let old = std::time::SystemTime::now() - Duration::from_secs(600);
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+
+        let old_update = helper("update");
+        let old_uninstall = helper("uninstall");
+        let fresh_update = helper("update");
+        let kept = helper("update");
+        let unrelated = root.join("origin-speak-update-helper-notes.exe");
+        let helper_named_dir = helper("update");
+        for path in [
+            &old_update,
+            &old_uninstall,
+            &fresh_update,
+            &kept,
+            &unrelated,
+        ] {
+            fs::write(path, b"helper").unwrap();
+        }
+        for path in [&old_update, &old_uninstall, &kept, &unrelated] {
+            age(path);
+        }
+        fs::create_dir(&helper_named_dir).unwrap();
+
+        let removed = remove_stale_post_exit_helpers(&root, Some(&kept), STALE_HELPER_MIN_AGE);
+
+        assert_eq!(removed, 2);
+        assert!(!old_update.exists());
+        assert!(!old_uninstall.exists());
+        assert!(fresh_update.exists());
+        assert!(kept.exists());
+        assert!(unrelated.exists());
+        assert!(helper_named_dir.is_dir());
         fs::remove_dir_all(root).unwrap();
     }
 
