@@ -1,0 +1,47 @@
+name: "CI"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Use a short Cargo target directory
+        shell: bash
+        # Native C++ dependency builds can exceed Windows path limits under the workspace.
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/t" >> "$GITHUB_ENV"
+
+      - name: Check backend formatting
+        run: cargo fmt --manifest-path backend/Cargo.toml -- --check
+
+      - name: Test backend
+        run: cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: Check native formatting
+        run: cargo fmt --manifest-path native/Cargo.toml -- --check
+
+      - name: Check native build
+        run: cargo check --manifest-path native/Cargo.toml --locked

@@ -8,16 +8,42 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   cut-release:
+    needs: checks
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Required to dispatch release.yml; tags pushed with GITHUB_TOKEN do not trigger workflows.
+      actions: write
     steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Cut Release must run on main (got ${GITHUB_REF})."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Release exactly the commit the checks ran against.
+          ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - name: Require a new tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} already exists."
+            exit 1
+          fi
 
       - name: Bump version files
         run: python3 scripts/version.py bump "${{ inputs.version }}"
@@ -37,11 +63,12 @@ jobs:
           git add backend/Cargo.toml backend/Cargo.lock native/Cargo.toml native/Cargo.lock
           git commit -m "chore(release): v${VERSION}"
           git tag "v${VERSION}"
-          git push origin HEAD
+          # Rejected (non-fast-forward) if main moved after the checks started.
+          git push origin HEAD:refs/heads/main
           git push origin "v${VERSION}"
 
       - name: Start native package publication
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
-        run: gh workflow run release.yml --ref main -f "version=$VERSION"
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f "version=$VERSION"
